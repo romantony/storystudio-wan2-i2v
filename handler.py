@@ -69,22 +69,21 @@ class ModelConfig:
         required_file = Path(model_dir) / "models_t5_umt5-xxl-enc-bf16.pth"
         
         if not required_file.exists():
-            print(f"Downloading model (~11GB)...")
-            os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
+            print(f"Downloading model (~11GB) to {model_dir}...")
+            print(f"Disk space check...")
+            os.system("df -h /runpod-volume")
+            
+            os.makedirs(model_dir, exist_ok=True)
+            
+            # Set HF cache to the model dir to avoid double storage
+            os.environ["HF_HOME"] = model_dir
+            os.environ["HF_HUB_CACHE"] = model_dir
+            
             snapshot_download(
                 repo_id=MODEL_ID,
                 local_dir=model_dir,
-                local_dir_use_symlinks=False,  # Don't use symlinks, save directly
+                local_dir_use_symlinks=False,
             )
-            # Clean up HuggingFace cache to save disk space
-            hf_cache = Path(os.getenv("HF_HOME", "/runpod-volume/huggingface"))
-            if hf_cache.exists():
-                import shutil
-                try:
-                    shutil.rmtree(hf_cache / "hub", ignore_errors=True)
-                    print("✓ Cleaned up HF cache")
-                except:
-                    pass
             print("✓ Model downloaded")
         else:
             print("✓ Model found in cache")
