@@ -65,7 +65,10 @@ class ModelConfig:
         
         model_dir = f"{MODEL_CACHE_DIR}/{MODEL_ID}"
         
-        if not Path(model_dir).exists():
+        # Check for a required model file to ensure download is complete
+        required_file = Path(model_dir) / "models_t5_umt5-xxl-enc-bf16.pth"
+        
+        if not required_file.exists():
             print(f"Downloading model (~49GB)...")
             os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
             snapshot_download(
