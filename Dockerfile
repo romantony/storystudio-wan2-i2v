@@ -27,7 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /workspace
 
 # Install Python dependencies (PyTorch already included in base image)
-# Note: I2V doesn't need librosa/soundfile (no audio processing)
+# Note: I2V doesn't need librosa/soundfile (S2V imports are patched out)
 RUN pip install --no-cache-dir \
     transformers==4.51.3 \
     diffusers==0.31.0 \

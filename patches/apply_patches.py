@@ -187,3 +187,52 @@ def flash_attention(*args, **kwargs):
 if __name__ == "__main__":
     success = apply_flashattention_patches()
     sys.exit(0 if success else 1)
+
+
+def apply_i2v_only_patches(wan_dir="/workspace/Wan2.2"):
+    """
+    Patch Wan2.2 to skip S2V imports for I2V-only deployments.
+    This avoids needing librosa/soundfile dependencies.
+    
+    Args:
+        wan_dir: Path to Wan2.2 repository
+        
+    Returns:
+        bool: True if patches applied successfully
+    """
+    print("\n" + "=" * 70)
+    print("Applying I2V-Only Patches (Skip S2V imports)")
+    print("=" * 70)
+    
+    wan_path = Path(wan_dir)
+    init_path = wan_path / "wan/__init__.py"
+    
+    if not init_path.exists():
+        print(f"⚠ wan/__init__.py not found at {init_path}")
+        return False
+    
+    init_code = init_path.read_text()
+    
+    # Check if already patched
+    if "# [PATCHED] I2V-only" in init_code:
+        print("✓ Already patched for I2V-only mode")
+        return True
+    
+    # Replace S2V imports with conditional imports that won't fail
+    # Original typically has: from .speech2video import WanS2V
+    new_init_code = '''# [PATCHED] I2V-only - S2V imports removed to avoid librosa dependency
+from .image2video import WanI2V
+
+# Skip S2V imports for I2V-only deployment
+# from .speech2video import WanS2V  # Removed - requires librosa
+# from .first_last_frame2video import WanFLF2V  # Removed if present
+
+__all__ = ["WanI2V"]
+'''
+    
+    init_path.write_text(new_init_code)
+    print("✓ wan/__init__.py patched for I2V-only mode")
+    print("  - Removed S2V imports (no librosa needed)")
+    print("  - Only WanI2V is exported")
+    
+    return True

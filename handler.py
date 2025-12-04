@@ -299,8 +299,9 @@ print("Note: PyTorch/CUDA will be initialized on first job (lazy loading)")
 
 # Apply FlashAttention patches (must be done before model loading)
 print("Applying FlashAttention compatibility patches...")
-from patches.apply_patches import apply_flashattention_patches
+from patches.apply_patches import apply_flashattention_patches, apply_i2v_only_patches
 apply_flashattention_patches()
+apply_i2v_only_patches()
 print("✓ Patches applied")
 
 # Model loading happens on first job request to avoid cold start timeout
