@@ -199,13 +199,21 @@ import sys
 # Set CUDA environment before any imports
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
-# Initialize PyTorch CUDA context first
+# Initialize PyTorch CUDA context
 import torch
-torch.cuda.init()
-torch.cuda.set_device(0)
-_ = torch.zeros(1, device="cuda:0")
-print(f"CUDA initialized: {{torch.cuda.get_device_name(0)}}", flush=True)
+print(f"PyTorch version: {{torch.__version__}}", flush=True)
+print(f"CUDA available: {{torch.cuda.is_available()}}", flush=True)
+
+if torch.cuda.is_available():
+    print(f"CUDA device count: {{torch.cuda.device_count()}}", flush=True)
+    print(f"CUDA device: {{torch.cuda.get_device_name(0)}}", flush=True)
+    # Simple tensor allocation instead of explicit init
+    _ = torch.zeros(1, device="cuda")
+    print("CUDA initialized successfully", flush=True)
+else:
+    print("WARNING: CUDA not available!", flush=True)
 
 # Patch safetensors to load to CPU (workaround for rust backend cuda:0 issue)
 from safetensors import torch as safetensors_torch
