@@ -5,7 +5,7 @@ FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    MODEL_CACHE_DIR=/runpod-volume \
+    MODEL_CACHE_DIR=/runpod-volume/models \
     HF_HOME=/runpod-volume/huggingface \
     PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 
