@@ -1,0 +1,34 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test files
+test_*.py
+test_*.mp3
+test_*.wav
+test_*.png
+test_*.jpg
+
+# Keys
+*.pem
+*.pub
+
+# Logs
+*.log
+*.out
+
+# Local builds
+build/
+dist/

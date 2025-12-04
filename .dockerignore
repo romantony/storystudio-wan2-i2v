@@ -1,0 +1,51 @@
+# Git
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+*.egg
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test files
+test_*.py
+*.mp3
+*.wav
+*.png
+*.jpg
+*.mp4
+
+# Docs
+*.md
+!README.md
+
+# Build artifacts
+*.log
+*.out
+
+# Keys and secrets
+*.pem
+*.pub
+
+# Local scripts
+*.bat
+*.sh
+!start.sh
