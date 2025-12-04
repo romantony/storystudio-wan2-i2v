@@ -69,13 +69,22 @@ class ModelConfig:
         required_file = Path(model_dir) / "models_t5_umt5-xxl-enc-bf16.pth"
         
         if not required_file.exists():
-            print(f"Downloading model (~49GB)...")
+            print(f"Downloading model (~11GB)...")
             os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
             snapshot_download(
                 repo_id=MODEL_ID,
                 local_dir=model_dir,
-                cache_dir=MODEL_CACHE_DIR,
+                local_dir_use_symlinks=False,  # Don't use symlinks, save directly
             )
+            # Clean up HuggingFace cache to save disk space
+            hf_cache = Path(os.getenv("HF_HOME", "/runpod-volume/huggingface"))
+            if hf_cache.exists():
+                import shutil
+                try:
+                    shutil.rmtree(hf_cache / "hub", ignore_errors=True)
+                    print("✓ Cleaned up HF cache")
+                except:
+                    pass
             print("✓ Model downloaded")
         else:
             print("✓ Model found in cache")
