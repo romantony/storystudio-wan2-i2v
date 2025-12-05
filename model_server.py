@@ -146,7 +146,7 @@ class ModelServer:
                 shift=shift,
                 sampling_steps=sample_steps,
                 seed=int(time.time()) % 2**32,
-                offload_model=False,  # Keep model in GPU for speed
+                offload_model=True,  # Offload between high/low noise models to save VRAM
             )
             
             # Save video
