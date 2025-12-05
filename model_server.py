@@ -109,8 +109,7 @@ class ModelServer:
     def generate_video(self, params: dict) -> dict:
         """Generate a video using the warm model"""
         import torch
-        from wan.configs import SIZE_CONFIGS
-        from wan.utils.prompt_extend import DashScopePromptExpander
+        from PIL import Image
         
         start_time = time.time()
         
@@ -122,22 +121,32 @@ class ModelServer:
             frame_num = params.get("frame_num", 81)
             output_path = params["output_path"]
             
-            # Get size configuration
-            size = RESOLUTION_MAP[resolution]
-            size_cfg = SIZE_CONFIGS[size]
+            # Calculate max_area based on resolution
+            # 480p = 832x480, 720p = 1280x720
+            if resolution == "720p":
+                max_area = 1280 * 720
+                shift = 5.0
+            else:  # 480p
+                max_area = 832 * 480
+                shift = 3.0  # Recommended for 480p
             
             print(f"Generating video: {resolution}, {sample_steps} steps, {frame_num} frames")
             print(f"Image: {image_path}")
             print(f"Prompt: {prompt[:100]}...")
             
-            # Generate video
+            # Load image as PIL Image
+            img = Image.open(image_path).convert("RGB")
+            
+            # Generate video using correct API
             video = self.pipe.generate(
-                prompt=prompt,
-                image=image_path,
+                input_prompt=prompt,
+                img=img,
+                max_area=max_area,
                 frame_num=frame_num,
-                size=size_cfg,
-                sample_steps=sample_steps,
-                seed=int(time.time()) % 2**32,  # Random seed
+                shift=shift,
+                sampling_steps=sample_steps,
+                seed=int(time.time()) % 2**32,
+                offload_model=False,  # Keep model in GPU for speed
             )
             
             # Save video
