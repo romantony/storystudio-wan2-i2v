@@ -69,10 +69,11 @@ RUN git clone https://github.com/Wan-Video/Wan2.2.git && \
 
 # Copy application files
 COPY patches/ ./patches/
-COPY handler.py .
+COPY handler_v2.py ./handler.py
+COPY model_server.py ./handler/model_server.py
 
-# Create directories for models and outputs
-RUN mkdir -p /runpod-volume/models /runpod-volume/huggingface /workspace/outputs
+# Create directories for models, outputs, and handler
+RUN mkdir -p /runpod-volume/models /runpod-volume/huggingface /workspace/outputs /workspace/handler
 
 # Expose port for FastAPI
 EXPOSE 8000
