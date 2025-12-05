@@ -91,7 +91,6 @@ class ModelServer:
             rank=0,
             t5_fsdp=False,
             dit_fsdp=False,
-            use_usp=False,
             t5_cpu=False,
         )
         
