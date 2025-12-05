@@ -180,9 +180,9 @@ class ModelServer:
             # Clear cache after generation
             torch.cuda.empty_cache()
             
-            # Save video
-            from wan.utils.utils import cache_video
-            cache_video(
+            # Save video using save_video (not cache_video which doesn't exist)
+            from wan.utils.utils import save_video
+            save_video(
                 tensor=video[None],
                 save_file=output_path,
                 fps=16,
