@@ -150,7 +150,7 @@ class ModelServer:
             # Generate video using correct API
             # offload_model=False keeps model in GPU (fast but needs VRAM)
             # offload_model=True swaps to CPU (slow but saves VRAM)
-            # A100 80GB should handle False for 480p
+            # A100 80GB needs offload_model=True for 14B model
             video = self.pipe.generate(
                 input_prompt=prompt,
                 img=img,
@@ -159,7 +159,7 @@ class ModelServer:
                 shift=shift,
                 sampling_steps=sample_steps,
                 seed=int(time.time()) % 2**32,
-                offload_model=False,  # Keep in GPU for speed (A100 80GB)
+                offload_model=True,  # Swap to CPU to avoid OOM (required for 14B model)
             )
             
             # Clear cache after generation
