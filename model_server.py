@@ -134,10 +134,23 @@ class ModelServer:
             print(f"Image: {image_path}")
             print(f"Prompt: {prompt[:100]}...")
             
+            # Print GPU memory before generation
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                print(f"GPU Memory before: {allocated:.1f}GB/{total:.1f}GB (reserved: {reserved:.1f}GB)")
+            
             # Load image as PIL Image
             img = Image.open(image_path).convert("RGB")
             
+            # Clear CUDA cache before generation to free up memory
+            torch.cuda.empty_cache()
+            
             # Generate video using correct API
+            # offload_model=False keeps model in GPU (fast but needs VRAM)
+            # offload_model=True swaps to CPU (slow but saves VRAM)
+            # A100 80GB should handle False for 480p
             video = self.pipe.generate(
                 input_prompt=prompt,
                 img=img,
@@ -146,8 +159,11 @@ class ModelServer:
                 shift=shift,
                 sampling_steps=sample_steps,
                 seed=int(time.time()) % 2**32,
-                offload_model=True,  # Offload between high/low noise models to save VRAM
+                offload_model=False,  # Keep in GPU for speed (A100 80GB)
             )
+            
+            # Clear cache after generation
+            torch.cuda.empty_cache()
             
             # Save video
             from wan.utils.utils import cache_video
