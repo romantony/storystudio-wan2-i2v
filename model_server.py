@@ -151,16 +151,31 @@ class ModelServer:
             # offload_model=False keeps model in GPU (fast but needs VRAM)
             # offload_model=True swaps to CPU (slow but saves VRAM)
             # A100 80GB needs offload_model=True for 14B model
-            video = self.pipe.generate(
-                input_prompt=prompt,
-                img=img,
-                max_area=max_area,
-                frame_num=frame_num,
-                shift=shift,
-                sampling_steps=sample_steps,
-                seed=int(time.time()) % 2**32,
-                offload_model=True,  # Swap to CPU to avoid OOM (required for 14B model)
-            )
+            print(f"Starting generation with offload_model=True...")
+            print(f"This will take 15-25 minutes with CPU offloading...")
+            gen_start = time.time()
+            
+            try:
+                video = self.pipe.generate(
+                    input_prompt=prompt,
+                    img=img,
+                    max_area=max_area,
+                    frame_num=frame_num,
+                    shift=shift,
+                    sampling_steps=sample_steps,
+                    seed=int(time.time()) % 2**32,
+                    offload_model=True,  # Swap to CPU to avoid OOM (required for 14B model)
+                )
+                print(f"Generation completed in {time.time() - gen_start:.1f}s")
+            except Exception as gen_error:
+                print(f"GENERATION ERROR: {gen_error}")
+                traceback.print_exc()
+                # Print GPU state after error
+                if torch.cuda.is_available():
+                    allocated = torch.cuda.memory_allocated() / 1024**3
+                    reserved = torch.cuda.memory_reserved() / 1024**3
+                    print(f"GPU Memory after error: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved")
+                raise gen_error
             
             # Clear cache after generation
             torch.cuda.empty_cache()
@@ -194,6 +209,16 @@ class ModelServer:
     
     def run(self):
         """Run the model server, listening for requests"""
+        import signal
+        
+        # Set up signal handlers to handle shutdown gracefully
+        def signal_handler(signum, frame):
+            print(f"Received signal {signum}, shutting down...")
+            sys.exit(0)
+        
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+        
         # Load model on startup
         self.load_model()
         
@@ -231,16 +256,33 @@ class ModelServer:
                 print(f"\nReceived job request: {request.get('job_id', 'unknown')}")
                 
                 # Generate video
+                print(f"Processing generation request...")
                 result = self.generate_video(request)
+                print(f"Generation result: success={result.get('success')}")
                 
                 # Send response
                 response = json.dumps(result) + "\n"
-                conn.sendall(response.encode())
-                conn.close()
+                try:
+                    conn.sendall(response.encode())
+                except Exception as send_error:
+                    print(f"Error sending response: {send_error}")
+                finally:
+                    conn.close()
                 
             except Exception as e:
                 print(f"Server error: {e}")
                 traceback.print_exc()
+                # Try to send error response
+                try:
+                    error_response = json.dumps({"success": False, "error": str(e)}) + "\n"
+                    conn.sendall(error_response.encode())
+                except:
+                    pass
+                finally:
+                    try:
+                        conn.close()
+                    except:
+                        pass
 
 
 if __name__ == "__main__":

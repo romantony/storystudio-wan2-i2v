@@ -117,27 +117,64 @@ def start_model_server():
     raise Exception("Model server failed to start within timeout")
 
 def send_to_model_server(request: dict, timeout: int = 3600) -> dict:
-    """Send a job request to the model server"""
+    """Send a job request to the model server with robust error handling"""
+    global model_server_process
+    
+    # Check if model server is still running
+    if model_server_process is not None:
+        poll = model_server_process.poll()
+        if poll is not None:
+            print(f"WARNING: Model server process died with code {poll}")
+            # Try to get any remaining output
+            if model_server_process.stdout:
+                remaining = model_server_process.stdout.read()
+                if remaining:
+                    print(f"Model server final output: {remaining}")
+            raise Exception(f"Model server process died unexpectedly (exit code: {poll})")
+    
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(timeout)
-    sock.connect(SOCKET_PATH)
+    
+    try:
+        sock.connect(SOCKET_PATH)
+    except socket.error as e:
+        raise Exception(f"Failed to connect to model server: {e}. Server may have crashed.")
     
     # Send request
     message = json.dumps(request) + "\n\n"
     sock.sendall(message.encode())
     
-    # Receive response
+    # Receive response with better handling
     data = b""
-    while True:
-        chunk = sock.recv(4096)
-        if not chunk:
-            break
-        data += chunk
-        if b"\n" in data:
-            break
+    try:
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                # Connection closed
+                break
+            data += chunk
+            if b"\n" in data:
+                break
+    except socket.timeout:
+        sock.close()
+        raise Exception(f"Socket read timeout after {timeout}s - generation may still be running")
     
     sock.close()
-    return json.loads(data.decode().strip())
+    
+    # Check for empty response
+    response_str = data.decode().strip()
+    if not response_str:
+        # Check if server is still alive
+        if model_server_process is not None:
+            poll = model_server_process.poll()
+            if poll is not None:
+                raise Exception(f"Model server crashed during generation (exit code: {poll})")
+        raise Exception("Empty response from model server - server may have crashed or timed out")
+    
+    try:
+        return json.loads(response_str)
+    except json.JSONDecodeError as e:
+        raise Exception(f"Invalid JSON from model server: {e}. Response was: {response_str[:500]}")
 
 def get_r2_client():
     """Initialize and return R2 S3 client"""
