@@ -155,11 +155,12 @@ class ModelServer:
             # offload_model=False keeps model in GPU (fast but needs VRAM)
             # offload_model=True swaps to CPU (slow but saves VRAM)
             # A100 80GB needs offload_model=True for 14B model
-            print(f"Starting generation with offload_model=True...")
-            print(f"This will take 15-25 minutes with CPU offloading...")
+            print(f"Starting generation with offload_model=True...", flush=True)
+            print(f"This will take 15-25 minutes with CPU offloading...", flush=True)
             gen_start = time.time()
             
             try:
+                print(f"Calling pipe.generate()...", flush=True)
                 video = self.pipe.generate(
                     input_prompt=prompt,
                     img=img,
@@ -170,32 +171,37 @@ class ModelServer:
                     seed=int(time.time()) % 2**32,
                     offload_model=True,  # Swap to CPU to avoid OOM (required for 14B model)
                 )
+                print(f"pipe.generate() returned", flush=True)
                 gen_elapsed = time.time() - gen_start
-                print(f"Generation completed in {gen_elapsed:.1f}s")
+                print(f"Generation completed in {gen_elapsed:.1f}s", flush=True)
                 
                 # Validate video output
                 if video is None:
                     raise Exception("Generation returned None - model failed to produce output")
                 
-                print(f"Video tensor shape: {video.shape}, dtype: {video.dtype}")
+                print(f"Video tensor shape: {video.shape}, dtype: {video.dtype}", flush=True)
                 
             except Exception as gen_error:
-                print(f"GENERATION ERROR: {gen_error}")
+                print(f"GENERATION ERROR: {gen_error}", flush=True)
                 traceback.print_exc()
+                sys.stdout.flush()
+                sys.stderr.flush()
                 # Print GPU state after error
                 if torch.cuda.is_available():
                     allocated = torch.cuda.memory_allocated() / 1024**3
                     reserved = torch.cuda.memory_reserved() / 1024**3
-                    print(f"GPU Memory after error: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved")
+                    print(f"GPU Memory after error: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved", flush=True)
                 raise gen_error
             
             # Clear cache after generation
+            print(f"Clearing CUDA cache...", flush=True)
             torch.cuda.empty_cache()
             
             # Save video using save_video (not cache_video which doesn't exist)
-            print(f"Saving video to {output_path}...")
+            print(f"Saving video to {output_path}...", flush=True)
             try:
                 from wan.utils.utils import save_video
+                print(f"Calling save_video...", flush=True)
                 save_video(
                     tensor=video[None],
                     save_file=output_path,
@@ -204,7 +210,7 @@ class ModelServer:
                     normalize=True,
                     value_range=(-1, 1),
                 )
-                print(f"Video saved successfully")
+                print(f"Video saved successfully", flush=True)
                 
                 # Verify file was created
                 import os
@@ -212,10 +218,10 @@ class ModelServer:
                     raise Exception(f"Video file was not created at {output_path}")
                 
                 file_size = os.path.getsize(output_path)
-                print(f"Video file size: {file_size / 1024 / 1024:.2f} MB")
+                print(f"Video file size: {file_size / 1024 / 1024:.2f} MB", flush=True)
                 
             except Exception as save_error:
-                print(f"VIDEO SAVE ERROR: {save_error}")
+                print(f"VIDEO SAVE ERROR: {save_error}", flush=True)
                 traceback.print_exc()
                 raise save_error
             
@@ -296,18 +302,26 @@ class ModelServer:
                 print(f"\nReceived job request: {request.get('job_id', 'unknown')}")
                 
                 # Generate video
-                print(f"Processing generation request...")
+                print(f"Processing generation request...", flush=True)
                 result = self.generate_video(request)
-                print(f"Generation result: success={result.get('success')}")
+                print(f"Generation result: success={result.get('success')}", flush=True)
+                if not result.get('success'):
+                    print(f"Error details: {result.get('error')}", flush=True)
+                else:
+                    print(f"Output path: {result.get('output_path')}", flush=True)
                 
                 # Send response
+                print(f"Sending response back to handler...", flush=True)
                 response = json.dumps(result) + "\n"
+                print(f"Response length: {len(response)} bytes", flush=True)
                 try:
                     conn.sendall(response.encode())
+                    print(f"Response sent successfully", flush=True)
                 except Exception as send_error:
-                    print(f"Error sending response: {send_error}")
+                    print(f"Error sending response: {send_error}", flush=True)
                 finally:
                     conn.close()
+                    print(f"Connection closed", flush=True)
                 
             except Exception as e:
                 print(f"Server error: {e}")

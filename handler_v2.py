@@ -153,6 +153,7 @@ def send_to_model_server(request: dict, timeout: int = 3600) -> dict:
     # Send request
     message = json.dumps(request) + "\n\n"
     sock.sendall(message.encode())
+    print(f"Request sent to model server ({len(message)} bytes)", flush=True)
     
     # Receive response with better handling
     data = b""
@@ -161,9 +162,12 @@ def send_to_model_server(request: dict, timeout: int = 3600) -> dict:
             chunk = sock.recv(4096)
             if not chunk:
                 # Connection closed
+                print(f"Connection closed by server, received {len(data)} bytes total", flush=True)
                 break
             data += chunk
+            print(f"Received chunk: {len(chunk)} bytes, total: {len(data)} bytes", flush=True)
             if b"\n" in data:
+                print(f"Found newline, breaking receive loop", flush=True)
                 break
     except socket.timeout:
         sock.close()
