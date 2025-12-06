@@ -269,18 +269,30 @@ class ModelServer:
             try:
                 conn, _ = server.accept()
                 
-                # Receive request
+                # Receive request with timeout
+                conn.settimeout(5.0)  # 5 second timeout for receiving data
                 data = b""
-                while True:
-                    chunk = conn.recv(4096)
-                    if not chunk:
-                        break
-                    data += chunk
-                    if b"\n\n" in data:
-                        break
+                try:
+                    while True:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            break
+                        data += chunk
+                        if b"\n\n" in data:
+                            break
+                except socket.timeout:
+                    # Timeout waiting for data - might be a health check
+                    pass
+                
+                # Check for empty request (health check / connection test)
+                request_str = data.decode().strip()
+                if not request_str:
+                    # Empty request - just a connection test, close silently
+                    conn.close()
+                    continue
                 
                 # Parse request
-                request = json.loads(data.decode().strip())
+                request = json.loads(request_str)
                 print(f"\nReceived job request: {request.get('job_id', 'unknown')}")
                 
                 # Generate video
