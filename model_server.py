@@ -15,6 +15,10 @@ import time
 import traceback
 from pathlib import Path
 
+# Force unbuffered output for real-time logging
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 # Set CUDA environment before any imports
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -166,7 +170,15 @@ class ModelServer:
                     seed=int(time.time()) % 2**32,
                     offload_model=True,  # Swap to CPU to avoid OOM (required for 14B model)
                 )
-                print(f"Generation completed in {time.time() - gen_start:.1f}s")
+                gen_elapsed = time.time() - gen_start
+                print(f"Generation completed in {gen_elapsed:.1f}s")
+                
+                # Validate video output
+                if video is None:
+                    raise Exception("Generation returned None - model failed to produce output")
+                
+                print(f"Video tensor shape: {video.shape}, dtype: {video.dtype}")
+                
             except Exception as gen_error:
                 print(f"GENERATION ERROR: {gen_error}")
                 traceback.print_exc()
@@ -181,15 +193,31 @@ class ModelServer:
             torch.cuda.empty_cache()
             
             # Save video using save_video (not cache_video which doesn't exist)
-            from wan.utils.utils import save_video
-            save_video(
-                tensor=video[None],
-                save_file=output_path,
-                fps=16,
-                nrow=1,
-                normalize=True,
-                value_range=(-1, 1),
-            )
+            print(f"Saving video to {output_path}...")
+            try:
+                from wan.utils.utils import save_video
+                save_video(
+                    tensor=video[None],
+                    save_file=output_path,
+                    fps=16,
+                    nrow=1,
+                    normalize=True,
+                    value_range=(-1, 1),
+                )
+                print(f"Video saved successfully")
+                
+                # Verify file was created
+                import os
+                if not os.path.exists(output_path):
+                    raise Exception(f"Video file was not created at {output_path}")
+                
+                file_size = os.path.getsize(output_path)
+                print(f"Video file size: {file_size / 1024 / 1024:.2f} MB")
+                
+            except Exception as save_error:
+                print(f"VIDEO SAVE ERROR: {save_error}")
+                traceback.print_exc()
+                raise save_error
             
             gen_time = time.time() - start_time
             print(f"✓ Video generated in {gen_time:.1f} seconds")

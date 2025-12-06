@@ -89,6 +89,18 @@ def start_model_server():
         bufsize=1
     )
     
+    # Start a background thread to continuously read and print model server output
+    import threading
+    def read_model_server_output():
+        while model_server_process is not None and model_server_process.poll() is None:
+            if model_server_process.stdout:
+                line = model_server_process.stdout.readline()
+                if line:
+                    print(f"[ModelServer] {line.rstrip()}", flush=True)
+    
+    output_thread = threading.Thread(target=read_model_server_output, daemon=True)
+    output_thread.start()
+    
     # Wait for server to be ready (model to be loaded)
     print("Waiting for model to load into GPU memory...")
     start_time = time.time()
@@ -106,11 +118,9 @@ def start_model_server():
             except:
                 pass
         
-        # Read and print server output
-        if model_server_process.stdout:
-            line = model_server_process.stdout.readline()
-            if line:
-                print(f"[ModelServer] {line.rstrip()}")
+        # Check if process crashed
+        if model_server_process.poll() is not None:
+            raise Exception(f"Model server crashed with exit code: {model_server_process.poll()}")
         
         time.sleep(1)
     
