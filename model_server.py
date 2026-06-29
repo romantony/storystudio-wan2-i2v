@@ -9,11 +9,17 @@ an empty weight_map in the index.json.  Standard WanModel.from_pretrained()
 loads nothing from this format, resulting in randomly-initialised weights.
 
 We let WanI2V load T5/VAE normally, then replace the DiT parameters by
-scanning all *.safetensors files in the _fp8 subdirectories and assembling
-the state dict manually.  FP8 tensors are cast to BF16 for compatibility with
-the native Wan forward pass.  With offload_model=True during generate(), only
-one 14B DiT (≈28.6 GB BF16) resides on the GPU at a time, fitting in 32 GB.
+scanning all *.safetensors files in the _fp8 subdirectories, processing one
+shard (~300 MB FP8) at a time to avoid accumulating the full ~14 GB FP8
+state dict in CPU RAM.  Each shard is loaded, cast to BF16, assigned directly
+to the model parameter, then freed before the next shard is loaded.
+
+After high_noise is fully loaded (BF16 on CPU), it is moved to GPU before
+low_noise is loaded, keeping peak CPU RAM around 40 GB instead of ~70 GB.
+With offload_model=True during generate(), only one 14B DiT (~28.6 GB BF16)
+resides on the GPU at a time, fitting within 32 GB VRAM.
 """
+import gc
 import os
 import sys
 import json
@@ -42,15 +48,28 @@ RESOLUTIONS = {
 }
 
 
+def _assign_param(model: "torch.nn.Module", key: str, value: "torch.Tensor") -> None:
+    """Replace a model parameter by navigating the module hierarchy via its state-dict key."""
+    import torch
+    parts = key.split('.')
+    module = model
+    for part in parts[:-1]:
+        module = getattr(module, part)
+    setattr(module, parts[-1], torch.nn.Parameter(value, requires_grad=False))
+
+
 def _load_perblock_weights(model, block_dir: str) -> None:
     """
-    Load nalexand per-block safetensors into an already-constructed WanModel.
+    Stream-load nalexand per-block safetensors directly into model parameters.
 
-    Each *.safetensors file is named after the top-level module it contains
-    (e.g. blocks.0.safetensors, patch_embedding.safetensors, head.safetensors).
-    Keys inside may be relative ('self_attn.q.weight') or absolute
-    ('blocks.0.self_attn.q.weight').  We resolve this by checking the model's
-    own state_dict keys, then cast every tensor to BF16.
+    Each *.safetensors shard (~300 MB FP8) is loaded, cast to BF16, and assigned
+    parameter-by-parameter to the model before the next shard is loaded.  This keeps
+    peak extra CPU RAM per shard to ~1 GB instead of accumulating a full 14 GB FP8
+    state dict — which would cause OOM when loading the second DiT on top of the first.
+
+    Keys inside each shard file may be relative ('self_attn.q.weight') or absolute
+    ('blocks.0.self_attn.q.weight').  We resolve by checking the model's own state_dict
+    keys with the file stem as prefix, then fall back to the raw key directly.
     """
     import torch
     from safetensors.torch import load_file
@@ -61,35 +80,43 @@ def _load_perblock_weights(model, block_dir: str) -> None:
         raise RuntimeError(f"No safetensors files found in {block_dir}")
 
     model_keys = set(model.state_dict().keys())
-    state_dict = {}
+    loaded = 0
+    missing_keys = set(model_keys)
+    unexpected_keys = []
 
     for shard_file in shard_files:
         module_prefix = shard_file.stem   # e.g. 'blocks.0', 'head', 'patch_embedding'
         tensors = load_file(str(shard_file))
 
         for raw_key, tensor in tensors.items():
-            # Try module_prefix.raw_key first (handles relative keys)
+            # Resolve key: try module_prefix.raw_key first (handles relative keys)
             candidate_abs = f"{module_prefix}.{raw_key}"
             if candidate_abs in model_keys:
-                state_dict[candidate_abs] = tensor.to(torch.bfloat16)
+                abs_key = candidate_abs
             elif raw_key in model_keys:
-                # raw_key is already an absolute path
-                state_dict[raw_key] = tensor.to(torch.bfloat16)
+                abs_key = raw_key
             else:
-                # Store with prefix; load_state_dict will flag as unexpected
-                state_dict[candidate_abs] = tensor.to(torch.bfloat16)
+                unexpected_keys.append(candidate_abs)
+                continue
 
-    result = model.load_state_dict(state_dict, strict=False, assign=True)
+            # Cast FP8 → BF16, assign directly, then let the shard-level del free FP8
+            bf16_tensor = tensor.to(torch.bfloat16)
+            _assign_param(model, abs_key, bf16_tensor)
+            missing_keys.discard(abs_key)
+            loaded += 1
 
-    loaded   = len(state_dict) - len(result.unexpected_keys)
-    missing  = len(result.missing_keys)
-    extra    = len(result.unexpected_keys)
+        # Free the entire FP8 shard before moving to the next one
+        del tensors
+        gc.collect()
+
+    missing = len(missing_keys)
+    extra = len(unexpected_keys)
     print(f"    {Path(block_dir).name}: {loaded} loaded, {missing} missing, {extra} unexpected")
 
-    if missing > 0:
-        print(f"    First 5 missing: {result.missing_keys[:5]}")
-    if extra > 0:
-        print(f"    First 5 unexpected: {result.unexpected_keys[:5]}")
+    if missing_keys:
+        print(f"    First 5 missing: {list(missing_keys)[:5]}")
+    if unexpected_keys:
+        print(f"    First 5 unexpected: {unexpected_keys[:5]}")
 
 
 class ModelServer:
@@ -119,9 +146,15 @@ class ModelServer:
         cfg.high_noise_checkpoint = 'high_noise_model_fp8'
         cfg.low_noise_checkpoint  = 'low_noise_model_fp8'
 
+        # Suppress verbose "Some weights not initialized" warnings from diffusers/transformers —
+        # expected because the per-block FP8 index.json has an empty weight_map.
+        import logging
+        logging.getLogger("diffusers").setLevel(logging.ERROR)
+        logging.getLogger("transformers").setLevel(logging.ERROR)
+
         # WanI2V correctly loads T5 and VAE.
-        # The DiT models get architecture-only (random weights) because the
-        # per-block safetensors format has an empty weight_map in the index.json.
+        # DiT models get architecture-only (meta device) because the per-block
+        # safetensors format has an empty weight_map in the index.json.
         self.pipe = WanI2V(
             config=cfg,
             checkpoint_dir=MODEL_PATH,
@@ -130,12 +163,14 @@ class ModelServer:
             t5_fsdp=False,
             dit_fsdp=False,
             use_sp=False,
-            t5_cpu=True,         # T5 (11.4 GB) stays on CPU
+            t5_cpu=True,           # T5 (11.4 GB) stays on CPU
             init_on_cpu=True,
             convert_model_dtype=False,
         )
 
-        # Replace random DiT weights with the actual FP8 weights (cast to BF16).
+        # Stream-load FP8 weights one shard at a time into each DiT.
+        # After high_noise is fully loaded to CPU as BF16, move it to GPU to free
+        # CPU RAM before loading low_noise (avoids ~71 GB peak → ~40 GB peak).
         print("Loading FP8 DiT weights (per-block format) → BF16 ...")
         for attr, subdir in [
             ('high_noise_model', 'high_noise_model_fp8'),
@@ -143,9 +178,14 @@ class ModelServer:
         ]:
             model = getattr(self.pipe, attr)
             block_dir = os.path.join(MODEL_PATH, subdir)
-            _load_perblock_weights(model, block_dir)
-            model.to(torch.bfloat16)          # ensure uniform BF16 dtype
-            setattr(self.pipe, attr, model)
+            _load_perblock_weights(model, block_dir)   # BF16 params on CPU
+
+            if attr == 'high_noise_model':
+                # Move to GPU now so CPU RAM is free for low_noise loading.
+                # offload_model=True in generate() handles swapping during inference.
+                print("    Moving high_noise_model to GPU ...")
+                model.to(torch.device('cuda', 0))
+                gc.collect()
 
         elapsed = time.time() - start
         allocated = torch.cuda.memory_allocated() / 1024**3
@@ -160,12 +200,12 @@ class ModelServer:
 
         start = time.time()
         try:
-            image_path  = params["image_path"]
-            prompt      = params.get("prompt", "")
-            resolution  = params.get("resolution", "480p")
+            image_path   = params["image_path"]
+            prompt       = params.get("prompt", "")
+            resolution   = params.get("resolution", "480p")
             sample_steps = params.get("sample_steps", 25)
-            frame_num   = params.get("frame_num", 81)
-            output_path = params["output_path"]
+            frame_num    = params.get("frame_num", 81)
+            output_path  = params["output_path"]
 
             if resolution not in RESOLUTIONS:
                 raise ValueError(f"Unknown resolution '{resolution}'. Choose 480p or 720p.")
@@ -177,8 +217,8 @@ class ModelServer:
 
             print(f"Generating {resolution} (max_area={max_area}), {frame_num} frames, {sample_steps} steps")
 
-            # generate() returns (C, N, H, W) tensor in range [-1, 1]
-            # offload_model=True swaps the inactive DiT to CPU during sampling
+            # generate() returns (C, N, H, W) tensor in range [-1, 1].
+            # offload_model=True swaps the inactive DiT to CPU during sampling.
             video_tensor = self.pipe.generate(
                 input_prompt=prompt,
                 img=image,
