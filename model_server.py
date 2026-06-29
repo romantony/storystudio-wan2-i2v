@@ -20,7 +20,7 @@ sys.stderr.reconfigure(line_buffering=True)
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
-MODEL_PATH = os.getenv("MODEL_PATH", "/runpod-volume/models/wan22-i2v-fp8")
+MODEL_PATH = os.getenv("MODEL_PATH", "/workspace/models/wan22-i2v-fp8")
 SOCKET_PATH = "/tmp/wan2_model_server.sock"
 
 # height, width, flow_shift per resolution

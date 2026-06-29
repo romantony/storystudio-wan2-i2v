@@ -25,7 +25,7 @@ from typing import Dict, Any
 from datetime import datetime
 
 # Configuration
-MODEL_PATH = os.getenv("MODEL_PATH", "/runpod-volume/models/wan22-i2v-fp8")
+MODEL_PATH = os.getenv("MODEL_PATH", "/workspace/models/wan22-i2v-fp8")
 SOCKET_PATH = "/tmp/wan2_model_server.sock"
 MODEL_SERVER_SCRIPT = "/workspace/handler/model_server.py"
 

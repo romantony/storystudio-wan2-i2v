@@ -4,8 +4,8 @@ FROM runpod/pytorch:2.6.0-py3.11-cuda12.6.3-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    MODEL_PATH=/runpod-volume/models/wan22-i2v-fp8 \
-    HF_HOME=/runpod-volume/huggingface \
+    MODEL_PATH=/workspace/models/wan22-i2v-fp8 \
+    HF_HOME=/workspace/huggingface \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -43,7 +43,7 @@ RUN pip install --no-cache-dir \
 COPY handler_v2.py ./handler.py
 COPY model_server.py ./handler/model_server.py
 
-RUN mkdir -p /runpod-volume/models /runpod-volume/huggingface /workspace/outputs /workspace/handler
+RUN mkdir -p /workspace/models /workspace/huggingface /workspace/outputs /workspace/handler
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD python3 -c "print('healthy')" || exit 1
