@@ -130,6 +130,15 @@ def _quantize_dit(dit_dir: Path, out_dir: Path) -> None:
     del output_groups
     gc.collect()
 
+    # WanI2V needs config.json to build the model architecture.
+    # Empty weight_map prevents it from trying to load the original shards.
+    config_src = dit_dir / 'config.json'
+    if config_src.exists():
+        shutil.copy2(config_src, out_dir / 'config.json')
+    (out_dir / 'model.safetensors.index.json').write_text(
+        '{"metadata": {}, "weight_map": {}}'
+    )
+
 
 # ── Copy non-DiT assets ───────────────────────────────────────────────────────
 
