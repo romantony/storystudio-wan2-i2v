@@ -19,8 +19,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /workspace
 
-# Clone Wan2.2 native code — provides wan.image2video.WanI2V and model classes
-RUN git clone --depth 1 https://github.com/Wan-Video/Wan2.2.git /workspace/wan22
+# Clone Wan2.2 native code — provides wan.image2video.WanI2V and model classes.
+# Rewrite wan/__init__.py to only import what we need; the original eagerly imports
+# WanS2V (needs decord), WanT2V, WanTI2V, and WanAnimate — none used here.
+RUN git clone --depth 1 https://github.com/Wan-Video/Wan2.2.git /workspace/wan22 && \
+    printf '# trimmed for i2v-only usage\nfrom . import configs, distributed, modules\nfrom .image2video import WanI2V\n' \
+    > /workspace/wan22/wan/__init__.py
 
 RUN python3 -m pip install --no-cache-dir \
     transformers==4.51.3 \
