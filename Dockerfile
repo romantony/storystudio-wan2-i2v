@@ -13,14 +13,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsm6 \
     libxext6 \
     libglib2.0-0 \
+    git \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 WORKDIR /workspace
 
+# Clone Wan2.2 native code — provides wan.image2video.WanI2V and model classes
+RUN git clone --depth 1 https://github.com/Wan-Video/Wan2.2.git /workspace/wan22
+
 RUN python3 -m pip install --no-cache-dir \
     transformers==4.51.3 \
-    diffusers==0.32.0 \
+    "diffusers>=0.33.0" \
     accelerate==1.3.0 \
     safetensors==0.4.5 \
     tokenizers==0.21.0 \
@@ -29,8 +33,9 @@ RUN python3 -m pip install --no-cache-dir \
     imageio==2.36.1 \
     imageio-ffmpeg==0.5.1 \
     pillow==11.0.0 \
-    numpy==1.26.4 \
+    "numpy>=1.23.5,<2" \
     ftfy==6.3.1 \
+    easydict \
     requests==2.32.3 \
     boto3==1.35.76 \
     runpod==1.7.5 \
@@ -40,7 +45,10 @@ RUN python3 -m pip install --no-cache-dir \
     python3 -m pip cache purge
 
 # Verify critical packages are importable by the runtime Python
-RUN python3 -c "import runpod; import diffusers; import torch; print(f'OK — runpod={runpod.__version__} diffusers={diffusers.__version__} torch={torch.__version__}')"
+RUN python3 -c "import runpod; import diffusers; import torch; import easydict; print(f'OK — runpod={runpod.__version__} diffusers={diffusers.__version__} torch={torch.__version__}')"
+
+# Verify Wan2.2 code is importable (no GPU needed, just import check)
+RUN PYTHONPATH=/workspace/wan22 python3 -c "from wan.configs import WAN_CONFIGS; print(f'Wan2.2 OK — configs: {list(WAN_CONFIGS.keys())}')"
 
 COPY handler_v2.py ./handler.py
 COPY model_server.py ./handler/model_server.py

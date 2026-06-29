@@ -1,10 +1,12 @@
 #!/usr/bin/env python
 """
 Persistent Model Server for Wan2.2-I2V-A14B-FP8
-Diffusers-based pipeline optimised for RTX 5090 (32 GB VRAM).
+Uses native Wan2.2 code with FP8 checkpoint directory override.
+Optimised for RTX 5090 (32 GB VRAM, native FP8).
 
-Runs as a background process. Loads model once on startup, then accepts
-generation jobs via Unix socket — eliminating repeated load time between jobs.
+Both 14B DiT experts load in FP8 (14.3 GB each = 28.6 GB total).
+T5 encoder (11.4 GB) stays on CPU. offload_model=True during generate
+swaps the inactive DiT to CPU so peak GPU usage stays under 32 GB.
 """
 import os
 import sys
@@ -20,13 +22,18 @@ sys.stderr.reconfigure(line_buffering=True)
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
+# Wan2.2 native code cloned into the image at build time
+WAN22_PATH = "/workspace/wan22"
+if WAN22_PATH not in sys.path:
+    sys.path.insert(0, WAN22_PATH)
+
 MODEL_PATH = os.getenv("MODEL_PATH", "/workspace/models/wan22-i2v-fp8")
 SOCKET_PATH = "/tmp/wan2_model_server.sock"
 
-# height, width, flow_shift per resolution
+# Resolution → (max_area, flow_shift)
 RESOLUTIONS = {
-    "480p": (480, 832, 3.0),
-    "720p": (720, 1280, 5.0),
+    "480p": (832 * 480, 3.0),
+    "720p": (1280 * 720, 5.0),
 }
 
 
@@ -36,7 +43,8 @@ class ModelServer:
 
     def load_model(self):
         import torch
-        from diffusers import DiffusionPipeline
+        from wan import WanI2V
+        from wan.configs import WAN_CONFIGS
 
         print(f"PyTorch {torch.__version__} | CUDA {torch.version.cuda}")
         print(f"GPU: {torch.cuda.get_device_name(0)}")
@@ -46,30 +54,41 @@ class ModelServer:
         if not Path(MODEL_PATH).exists():
             raise RuntimeError(
                 f"Model not found at {MODEL_PATH}. "
-                "Download model weights to the network volume before starting."
+                "Download nalexand/Wan2.2-I2V-A14B-FP8 to the network volume first."
             )
 
         print(f"Loading FP8 model from {MODEL_PATH} ...")
         start = time.time()
 
-        # FP8 weights are stored on disk; dequantised to BF16 at compute time.
-        # enable_model_cpu_offload() moves the T5 encoder back to CPU after the
-        # initial text encoding step, keeping peak VRAM under 32 GB on RTX 5090.
-        self.pipe = DiffusionPipeline.from_pretrained(
-            MODEL_PATH,
-            torch_dtype=torch.bfloat16,
-            local_files_only=True,
+        # Get A14B I2V config and redirect to FP8 checkpoint directories.
+        # nalexand stores actual weights in high_noise_model_fp8/ and low_noise_model_fp8/;
+        # the plain high_noise_model/ and low_noise_model/ dirs have empty weight maps.
+        cfg = WAN_CONFIGS['i2v-A14B']
+        cfg.high_noise_checkpoint = 'high_noise_model_fp8'
+        cfg.low_noise_checkpoint = 'low_noise_model_fp8'
+
+        self.pipe = WanI2V(
+            config=cfg,
+            checkpoint_dir=MODEL_PATH,
+            device_id=0,
+            rank=0,
+            t5_fsdp=False,
+            dit_fsdp=False,
+            use_sp=False,
+            t5_cpu=True,         # keep 11.4 GB T5 on CPU
+            init_on_cpu=True,
+            convert_model_dtype=False,  # keep FP8 dtype; both DiTs = 28.6 GB
         )
-        self.pipe.enable_model_cpu_offload()
 
         elapsed = time.time() - start
         allocated = torch.cuda.memory_allocated() / 1024**3
         reserved = torch.cuda.memory_reserved() / 1024**3
-        print(f"✓ Model loaded in {elapsed:.1f}s — {allocated:.1f}GB allocated / {reserved:.1f}GB reserved")
+        print(f"✓ Model loaded in {elapsed:.1f}s — {allocated:.1f} GB allocated / {reserved:.1f} GB reserved")
 
     def generate_video(self, params: dict) -> dict:
         import torch
-        from diffusers.utils import export_to_video
+        import numpy as np
+        import imageio
         from PIL import Image
 
         start = time.time()
@@ -84,27 +103,40 @@ class ModelServer:
             if resolution not in RESOLUTIONS:
                 raise ValueError(f"Unknown resolution '{resolution}'. Choose 480p or 720p.")
 
-            height, width, flow_shift = RESOLUTIONS[resolution]
+            max_area, flow_shift = RESOLUTIONS[resolution]
 
             image = Image.open(image_path).convert("RGB")
             torch.cuda.empty_cache()
 
-            print(f"Generating {resolution} ({width}x{height}), {frame_num} frames, {sample_steps} steps")
+            print(f"Generating {resolution} (max_area={max_area}), {frame_num} frames, {sample_steps} steps")
 
-            result = self.pipe(
-                image=image,
-                prompt=prompt,
-                height=height,
-                width=width,
-                num_frames=frame_num,
-                num_inference_steps=sample_steps,
-                guidance_scale=5.0,
-                flow_shift=flow_shift,
+            # generate() returns tensor (C, N, H, W) in range [-1, 1]
+            # offload_model=True swaps the inactive DiT to CPU during sampling
+            video_tensor = self.pipe.generate(
+                input_prompt=prompt,
+                img=image,
+                max_area=max_area,
+                frame_num=frame_num,
+                shift=flow_shift,
+                sample_solver='unipc',
+                sampling_steps=sample_steps,
+                guide_scale=5.0,
+                n_prompt="",
+                seed=-1,
+                offload_model=True,
             )
-            frames = result.frames[0]
+
+            # Convert (C, N, H, W) [-1, 1] tensor → (N, H, W, C) uint8 numpy
+            frames = (video_tensor.clamp(-1, 1) + 1) / 2       # [0, 1]
+            frames = frames.permute(1, 2, 3, 0).cpu().float().numpy()  # (N, H, W, C)
+            frames = (frames * 255).astype(np.uint8)
 
             torch.cuda.empty_cache()
-            export_to_video(frames, output_path, fps=16)
+
+            writer = imageio.get_writer(output_path, fps=16, codec='libx264', quality=8)
+            for frame in frames:
+                writer.append_data(frame)
+            writer.close()
 
             if not Path(output_path).exists():
                 raise RuntimeError(f"Video file was not created at {output_path}")
