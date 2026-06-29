@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /workspace
 
-RUN pip install --no-cache-dir \
+RUN python3 -m pip install --no-cache-dir \
     transformers==4.51.3 \
     diffusers==0.32.0 \
     accelerate==1.3.0 \
@@ -37,8 +37,10 @@ RUN pip install --no-cache-dir \
     filelock \
     "packaging>=20.0" \
     tqdm && \
-    rm -rf /root/.cache/pip && \
-    pip cache purge
+    python3 -m pip cache purge
+
+# Verify critical packages are importable by the runtime Python
+RUN python3 -c "import runpod; import diffusers; import torch; print(f'OK — runpod={runpod.__version__} diffusers={diffusers.__version__} torch={torch.__version__}')"
 
 COPY handler_v2.py ./handler.py
 COPY model_server.py ./handler/model_server.py
