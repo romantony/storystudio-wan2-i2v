@@ -37,6 +37,8 @@ RUN python3 -m pip install --no-cache-dir \
     ftfy==6.3.1 \
     easydict \
     einops \
+    torchvision \
+    regex \
     requests==2.32.3 \
     boto3==1.35.76 \
     runpod==1.7.5 \
