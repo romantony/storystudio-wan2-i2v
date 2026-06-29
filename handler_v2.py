@@ -11,6 +11,7 @@ os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')
 os.environ.setdefault('CUDA_DEVICE_ORDER', 'PCI_BUS_ID')
 
 # Now import other modules
+import sys
 import runpod
 import subprocess
 import tempfile
@@ -68,7 +69,7 @@ def start_model_server():
     
     # Start model server in background
     model_server_process = subprocess.Popen(
-        ["python", "-u", MODEL_SERVER_SCRIPT],
+        [sys.executable, "-u", MODEL_SERVER_SCRIPT],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
