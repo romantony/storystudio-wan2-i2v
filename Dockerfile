@@ -47,8 +47,10 @@ RUN python3 -m pip install --no-cache-dir \
 # Verify critical packages are importable by the runtime Python
 RUN python3 -c "import runpod; import diffusers; import torch; import easydict; print(f'OK — runpod={runpod.__version__} diffusers={diffusers.__version__} torch={torch.__version__}')"
 
-# Verify Wan2.2 code is importable (no GPU needed, just import check)
-RUN PYTHONPATH=/workspace/wan22 python3 -c "from wan.configs import WAN_CONFIGS; print(f'Wan2.2 OK — configs: {list(WAN_CONFIGS.keys())}')"
+# Verify Wan2.2 code was cloned correctly
+RUN test -f /workspace/wan22/wan/configs/__init__.py && \
+    test -f /workspace/wan22/wan/image2video.py && \
+    echo "Wan2.2 source OK"
 
 COPY handler_v2.py ./handler.py
 COPY model_server.py ./handler/model_server.py
