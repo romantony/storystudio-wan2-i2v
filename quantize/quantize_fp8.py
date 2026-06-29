@@ -39,7 +39,7 @@ from collections import defaultdict
 from pathlib import Path
 
 # ── Paths ────────────────────────────────────────────────────────────────────
-BF16_DIR   = sys.argv[1] if len(sys.argv) > 1 else "/workspace/models/wan22-i2v-bf16"
+BF16_DIR   = sys.argv[1] if len(sys.argv) > 1 else "/data/wan22-bf16"
 OUTPUT_DIR = sys.argv[2] if len(sys.argv) > 2 else "/workspace/models/wan22-i2v-qfp8"
 WAN22_SRC  = sys.argv[3] if len(sys.argv) > 3 else "/workspace/wan22"
 # ─────────────────────────────────────────────────────────────────────────────
