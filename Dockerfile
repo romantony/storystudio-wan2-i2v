@@ -1,6 +1,6 @@
 # Wan2.2-I2V-A14B-FP8 RunPod Serverless Dockerfile
 # Optimised for RTX 5090 (Blackwell) — requires CUDA 12.6+ and PyTorch 2.6+
-FROM runpod/pytorch:2.6.0-py3.11-cuda12.6.3-devel-ubuntu22.04
+FROM runpod/pytorch:1.0.7-cu1290-torch260-ubuntu2204
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
