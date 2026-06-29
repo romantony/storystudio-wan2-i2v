@@ -2,56 +2,50 @@
 """
 Quantize Wan2.2-I2V-A14B from BF16 to our FP8 format.
 
-Run on the RTX Pro 6000 (96 GB VRAM) after downloading the BF16 model:
-    python3 quantize_fp8.py
-    python3 quantize_fp8.py /workspace/models/wan22-i2v-bf16 /workspace/models/wan22-i2v-qfp8
+Loads directly from the downloaded safetensors shards — no WanI2V, no GPU needed.
+Processes one input shard at a time so peak RAM is ~one shard (~10 GB) plus the
+accumulated FP8 output for the current DiT (~28 GB). Works on CPU only.
 
-What it does
-------------
-1. Loads both DiTs as BF16 — both fit in 96 GB VRAM simultaneously.
-2. For every nn.Linear weight:
-       scale  = max(|W|) / 448        (448 = max of float8_e4m3fn)
-       fp8_W  = (W / scale).to(float8_e4m3fn)
-3. Saves per-block safetensors with ABSOLUTE state-dict keys:
-       blocks.0.self_attn.q.weight        → float8_e4m3fn
-       blocks.0.self_attn.q.weight.scale  → bfloat16 scalar
-       blocks.0.self_attn.q.bias          → bfloat16  (not quantized)
-       blocks.0.norm1.weight              → bfloat16  (not quantized)
-4. Non-linear params (norms, Conv3d, embeddings) stay BF16.
-5. T5, VAE, tokenizer copied unchanged from the BF16 source.
-6. Writes format.json so model_server.py picks the FP8 loader automatically.
+Usage:
+    python3 quantize_fp8.py
+    python3 quantize_fp8.py /workspace/data/wan22-bf16 /workspace/data/wan22-qfp8
 
 Output
 ------
 {OUTPUT_DIR}/
-  high_noise_model/   blocks.0.safetensors … blocks.39.safetensors, head.safetensors, …
-  low_noise_model/    (same structure)
-  text_encoder/       copied from BF16
-  tokenizer/          copied from BF16
-  vae/                copied from BF16
-  format.json
+  high_noise_model/   blocks.0.safetensors … head.safetensors …
+  low_noise_model/    (same)
+  models_t5_umt5-xxl-enc-bf16.pth   copied
+  Wan2.1_VAE.pth                     copied
+  google/                            copied (tokenizer)
+  configuration.json                 copied
+  format.json                        written by this script
 """
 import gc
 import json
 import shutil
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
-# ── Paths ────────────────────────────────────────────────────────────────────
-BF16_DIR   = sys.argv[1] if len(sys.argv) > 1 else "/data/wan22-bf16"
-OUTPUT_DIR = sys.argv[2] if len(sys.argv) > 2 else "/workspace/models/wan22-i2v-qfp8"
-WAN22_SRC  = sys.argv[3] if len(sys.argv) > 3 else "/workspace/wan22"
-# ─────────────────────────────────────────────────────────────────────────────
+BF16_DIR   = sys.argv[1] if len(sys.argv) > 1 else "/workspace/data/wan22-bf16"
+OUTPUT_DIR = sys.argv[2] if len(sys.argv) > 2 else "/workspace/data/wan22-qfp8"
 
 import torch
-import torch.nn as nn
+from safetensors.torch import load_file, save_file
 
-sys.path.insert(0, WAN22_SRC)
 
+# ── Key helpers ───────────────────────────────────────────────────────────────
 
 def _top_group(key: str) -> str:
-    """Map an absolute state-dict key to the shard file stem."""
+    """Map a state-dict key to the output shard file stem.
+
+    blocks.0.self_attn.q.weight  →  blocks.0
+    head.head.weight             →  head
+    patch_embedding.weight       →  patch_embedding
+    time_embedding.0.weight      →  time_embedding
+    """
     parts = key.split('.')
     if parts[0] == 'blocks':
         return f"blocks.{parts[1]}"
@@ -59,46 +53,113 @@ def _top_group(key: str) -> str:
 
 
 def _is_linear_weight(key: str, tensor: torch.Tensor) -> bool:
-    """True if this is a quantisable nn.Linear weight (2-D, not norm/embedding)."""
+    """True for nn.Linear weight matrices (2-D, not norm/embed/conv)."""
     if tensor.dim() != 2 or not key.endswith('.weight'):
         return False
     lower = key.lower()
-    return not any(tok in lower for tok in ('norm', 'embed', 'patch_embed', 'pos_embed'))
+    return not any(t in lower for t in ('norm', 'embed', 'patch_embed', 'pos_embed'))
 
 
 def _quantize(w: torch.Tensor):
-    """Per-tensor absmax → float8_e4m3fn.  Returns (fp8_weight, bf16_scale)."""
+    """Per-tensor absmax FP8.  Returns (fp8_weight, bf16_scale)."""
     w_f32 = w.float()
-    scale  = (w_f32.abs().max() / 448.0).clamp(min=1e-12)
-    fp8_w  = (w_f32 / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    scale = (w_f32.abs().max() / 448.0).clamp(min=1e-12)
+    fp8_w = (w_f32 / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
     return fp8_w, scale.to(torch.bfloat16)
 
 
-def _save_dit(model: nn.Module, out_dir: Path) -> None:
+# ── Per-DiT quantization ──────────────────────────────────────────────────────
+
+def _quantize_dit(dit_dir: Path, out_dir: Path) -> None:
+    """
+    Read sharded safetensors from dit_dir, quantize linear weights to FP8,
+    save as per-block safetensors to out_dir. CPU-only, one shard at a time.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
-    state = model.state_dict()
 
-    groups: dict[str, dict] = defaultdict(dict)
-    n_fp8 = 0
+    index_file = dit_dir / 'diffusion_pytorch_model.safetensors.index.json'
+    if not index_file.exists():
+        # Single-file model (no sharding)
+        shard_files = sorted(dit_dir.glob('diffusion_pytorch_model*.safetensors'))
+        weight_map  = {None: shard_files}   # sentinel: load all keys from each file
+    else:
+        with open(index_file) as f:
+            index = json.load(f)
+        weight_map = index['weight_map']    # key → shard filename
 
-    for key, tensor in state.items():
-        group = _top_group(key)
-        if _is_linear_weight(key, tensor):
-            fp8_w, scale = _quantize(tensor)
-            groups[group][key]            = fp8_w
-            groups[group][f"{key}.scale"] = scale
-            n_fp8 += 1
-        else:
-            groups[group][key] = tensor.to(torch.bfloat16)
+    # Build: shard filename → list of keys in that shard
+    shard_to_keys: dict[str, list] = defaultdict(list)
+    for key, shard in weight_map.items():
+        shard_to_keys[shard].append(key)
 
-    print(f"    {len(state)} params: {n_fp8} linear → FP8, {len(state)-n_fp8} other → BF16")
+    # Accumulate output groups across all shards
+    output_groups: dict[str, dict] = defaultdict(dict)
+    n_total = n_fp8 = 0
 
-    from safetensors.torch import save_file
-    for name in sorted(groups):
-        save_file(groups[name], str(out_dir / f"{name}.safetensors"))
+    for shard_name in sorted(shard_to_keys):
+        shard_path = dit_dir / shard_name
+        print(f"  {shard_name} ...", end='', flush=True)
+        t0 = time.time()
 
-    print(f"    Saved {len(groups)} shards → {out_dir}")
+        tensors = load_file(str(shard_path))
 
+        for key in shard_to_keys[shard_name]:
+            tensor = tensors[key]
+            group  = _top_group(key)
+
+            if _is_linear_weight(key, tensor):
+                fp8_w, scale = _quantize(tensor)
+                output_groups[group][key]            = fp8_w
+                output_groups[group][f"{key}.scale"] = scale
+                n_fp8 += 1
+            else:
+                output_groups[group][key] = tensor.to(torch.bfloat16)
+
+            n_total += 1
+
+        del tensors
+        gc.collect()
+        print(f" {time.time()-t0:.1f}s")
+
+    # Save per-block files
+    for group_name in sorted(output_groups):
+        save_file(output_groups[group_name], str(out_dir / f"{group_name}.safetensors"))
+
+    print(f"  → {n_total} params: {n_fp8} FP8 + {n_total-n_fp8} BF16"
+          f"  |  {len(output_groups)} shard files saved")
+    del output_groups
+    gc.collect()
+
+
+# ── Copy non-DiT assets ───────────────────────────────────────────────────────
+
+def _copy_assets(bf16_dir: Path, out_dir: Path) -> None:
+    """Copy T5, VAE, tokenizer and config files unchanged."""
+    COPY_DIRS  = ('google',)                 # tokenizer (google/umt5-xxl/)
+    COPY_FILES = (
+        'models_t5_umt5-xxl-enc-bf16.pth',  # T5 encoder weights
+        'Wan2.1_VAE.pth',                    # VAE weights
+        'configuration.json',
+        'config.json',
+    )
+
+    for name in COPY_DIRS:
+        src = bf16_dir / name
+        if src.exists():
+            dst = out_dir / name
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst)
+            print(f"  Copied {name}/")
+
+    for name in COPY_FILES:
+        src = bf16_dir / name
+        if src.exists():
+            shutil.copy2(src, out_dir / name)
+            print(f"  Copied {name}")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     bf16_dir   = Path(BF16_DIR)
@@ -107,80 +168,39 @@ def main():
     if not bf16_dir.exists():
         sys.exit(f"BF16 model not found: {bf16_dir}\nRun download.py first.")
 
-    from wan import WanI2V
-    from wan.configs import WAN_CONFIGS
-
-    print(f"PyTorch {torch.__version__} | CUDA {torch.version.cuda}")
-    print(f"GPU:   {torch.cuda.get_device_name(0)}")
-    print(f"VRAM:  {torch.cuda.get_device_properties(0).total_memory/1024**3:.0f} GB")
+    print(f"PyTorch {torch.__version__}")
     print(f"BF16:  {bf16_dir}")
-    print(f"Out:   {output_dir}\n")
+    print(f"Out:   {output_dir}")
+    print("Mode:  CPU-only (no GPU needed for weight quantization)\n")
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    import logging
-    logging.getLogger("diffusers").setLevel(logging.ERROR)
-    logging.getLogger("transformers").setLevel(logging.ERROR)
+    for subdir in ('high_noise_model', 'low_noise_model'):
+        dit_dir = bf16_dir / subdir
+        if not dit_dir.exists():
+            print(f"WARNING: {dit_dir} not found, skipping")
+            continue
+        print(f"Quantizing {subdir} ...")
+        t0 = time.time()
+        _quantize_dit(dit_dir, output_dir / subdir)
+        print(f"  Done in {time.time()-t0:.0f}s\n")
 
-    cfg = WAN_CONFIGS['i2v-A14B']
+    print("Copying T5 / VAE / tokenizer ...")
+    _copy_assets(bf16_dir, output_dir)
 
-    print("Loading BF16 model ...")
-    pipe = WanI2V(
-        config=cfg,
-        checkpoint_dir=str(bf16_dir),
-        device_id=0,
-        rank=0,
-        t5_fsdp=False,
-        dit_fsdp=False,
-        use_sp=False,
-        t5_cpu=True,
-        init_on_cpu=False,       # 96 GB VRAM: load both DiTs to GPU
-        convert_model_dtype=False,
-    )
-
-    for attr, subdir in [
-        ('high_noise_model', 'high_noise_model'),
-        ('low_noise_model',  'low_noise_model'),
-    ]:
-        model = getattr(pipe, attr).cpu()
-        print(f"\nQuantizing {attr} ...")
-        _save_dit(model, output_dir / subdir)
-        del model
-        torch.cuda.empty_cache()
-        gc.collect()
-
-    # Copy T5, VAE, tokenizer unchanged
-    print("\nCopying T5 / VAE / tokenizer ...")
-    for name in ('text_encoder', 'tokenizer', 'vae', 'scheduler'):
-        src = bf16_dir / name
-        if src.exists():
-            dst = output_dir / name
-            if dst.exists():
-                shutil.rmtree(dst)
-            shutil.copytree(src, dst)
-            print(f"  {name}/")
-
-    for name in ('model_index.json', 'config.json'):
-        src = bf16_dir / name
-        if src.exists():
-            shutil.copy2(src, output_dir / name)
-            print(f"  {name}")
-
-    # Format marker — model_server.py reads this to select the FP8 loader
     fmt = {
-        "format":       "wan22-i2v-qfp8-v1",
-        "quant":        "float8_e4m3fn",
-        "scale":        "per_tensor_absmax",
-        "non_linear":   "bfloat16",
+        "format":         "wan22-i2v-qfp8-v1",
+        "quant":          "float8_e4m3fn",
+        "scale":          "per_tensor_absmax",
+        "non_linear":     "bfloat16",
         "high_noise_dir": "high_noise_model",
         "low_noise_dir":  "low_noise_model",
     }
     (output_dir / 'format.json').write_text(json.dumps(fmt, indent=2))
 
     print(f"\n✓ Done → {output_dir}")
-    print("\nNext: copy the output to your production network volume")
-    print("      and set MODEL_PATH to point at it.")
-    print("      model_server.py will detect format.json and use the FP8 loader.")
+    print("Copy this directory to your production network volume,")
+    print("then set MODEL_PATH to point at it.")
 
 
 if __name__ == '__main__':
