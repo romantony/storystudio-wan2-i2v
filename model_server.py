@@ -79,7 +79,7 @@ def _load_perblock_weights(model, block_dir: str) -> None:
                 # Store with prefix; load_state_dict will flag as unexpected
                 state_dict[candidate_abs] = tensor.to(torch.bfloat16)
 
-    result = model.load_state_dict(state_dict, strict=False)
+    result = model.load_state_dict(state_dict, strict=False, assign=True)
 
     loaded   = len(state_dict) - len(result.unexpected_keys)
     missing  = len(result.missing_keys)
