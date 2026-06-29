@@ -1,282 +1,157 @@
 #!/usr/bin/env python
 """
-Persistent Model Server for Wan2.2 I2V
-Keeps the model warm in GPU memory between jobs to eliminate 6-minute load time.
+Persistent Model Server for Wan2.2-I2V-A14B-FP8
+Diffusers-based pipeline optimised for RTX 5090 (32 GB VRAM).
 
-This server runs as a background process and receives job requests via a Unix socket.
-The model is loaded once on startup and kept in memory for all subsequent jobs.
+Runs as a background process. Loads model once on startup, then accepts
+generation jobs via Unix socket — eliminating repeated load time between jobs.
 """
 import os
 import sys
 import json
 import socket
-import tempfile
 import time
 import traceback
 from pathlib import Path
 
-# Force unbuffered output for real-time logging
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
-# Set CUDA environment before any imports
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
-# Configuration
-MODEL_ID = "Wan-AI/Wan2.2-I2V-A14B"
-MODEL_CACHE_DIR = os.getenv("MODEL_CACHE_DIR", "/runpod-volume/models")
-WAN_DIR = "/workspace/Wan2.2"
+MODEL_PATH = os.getenv("MODEL_PATH", "/runpod-volume/models/wan22-i2v-fp8")
 SOCKET_PATH = "/tmp/wan2_model_server.sock"
 
-# Resolution mapping
-RESOLUTION_MAP = {
-    "480p": "832*480",
-    "720p": "1280*720"
+# height, width, flow_shift per resolution
+RESOLUTIONS = {
+    "480p": (480, 832, 3.0),
+    "720p": (720, 1280, 5.0),
 }
+
 
 class ModelServer:
     def __init__(self):
-        self.model_dir = f"{MODEL_CACHE_DIR}/{MODEL_ID}"
         self.pipe = None
-        self.image_encoder = None
-        self.model_loaded = False
-        
+
     def load_model(self):
-        """Load the model into GPU memory once"""
-        if self.model_loaded:
-            print("Model already loaded, skipping...")
-            return
-            
-        print("=" * 60)
-        print("LOADING MODEL INTO GPU MEMORY (ONE-TIME)")
-        print("=" * 60)
-        
-        start_time = time.time()
-        
-        # Initialize PyTorch and CUDA
         import torch
-        print(f"PyTorch version: {torch.__version__}")
-        print(f"CUDA available: {torch.cuda.is_available()}")
-        
-        if torch.cuda.is_available():
-            print(f"CUDA device: {torch.cuda.get_device_name(0)}")
-            # Warm up CUDA
-            _ = torch.zeros(1, device="cuda")
-            print("CUDA initialized")
-        
-        # Patch safetensors for CPU loading (workaround)
-        from safetensors import torch as safetensors_torch
-        _original_load = safetensors_torch.load_file
-        def _patched_load(filename, device="cpu"):
-            return _original_load(filename, device="cpu")
-        safetensors_torch.load_file = _patched_load
-        print("Patched safetensors for CPU loading")
-        
-        # Change to Wan2.2 directory
-        os.chdir(WAN_DIR)
-        sys.path.insert(0, WAN_DIR)
-        
-        # Import Wan2.2 modules
-        from wan.configs import WAN_CONFIGS, SIZE_CONFIGS, MAX_AREA_CONFIGS, SUPPORTED_SIZES
-        from wan.image2video import WanI2V
-        
-        # Load model configuration
-        cfg = WAN_CONFIGS["i2v-A14B"]
-        
-        print(f"Loading model from: {self.model_dir}")
-        
-        # Initialize the I2V pipeline
-        self.pipe = WanI2V(
-            config=cfg,
-            checkpoint_dir=self.model_dir,
-            device_id=0,
-            rank=0,
-            t5_fsdp=False,
-            dit_fsdp=False,
-            t5_cpu=False,
+        from diffusers import DiffusionPipeline
+
+        print(f"PyTorch {torch.__version__} | CUDA {torch.version.cuda}")
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"VRAM: {vram_gb:.1f} GB")
+
+        if not Path(MODEL_PATH).exists():
+            raise RuntimeError(
+                f"Model not found at {MODEL_PATH}. "
+                "Download model weights to the network volume before starting."
+            )
+
+        print(f"Loading FP8 model from {MODEL_PATH} ...")
+        start = time.time()
+
+        # FP8 weights are stored on disk; dequantised to BF16 at compute time.
+        # enable_model_cpu_offload() moves the T5 encoder back to CPU after the
+        # initial text encoding step, keeping peak VRAM under 32 GB on RTX 5090.
+        self.pipe = DiffusionPipeline.from_pretrained(
+            MODEL_PATH,
+            torch_dtype=torch.bfloat16,
+            local_files_only=True,
         )
-        
-        load_time = time.time() - start_time
-        print(f"✓ Model loaded in {load_time:.1f} seconds")
-        print("=" * 60)
-        
-        self.model_loaded = True
-        
-        # Print GPU memory usage
-        if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated() / 1024**3
-            reserved = torch.cuda.memory_reserved() / 1024**3
-            print(f"GPU Memory: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved")
-        
+        self.pipe.enable_model_cpu_offload()
+
+        elapsed = time.time() - start
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        print(f"✓ Model loaded in {elapsed:.1f}s — {allocated:.1f}GB allocated / {reserved:.1f}GB reserved")
+
     def generate_video(self, params: dict) -> dict:
-        """Generate a video using the warm model"""
         import torch
+        from diffusers.utils import export_to_video
         from PIL import Image
-        
-        start_time = time.time()
-        
+
+        start = time.time()
         try:
             image_path = params["image_path"]
             prompt = params.get("prompt", "")
             resolution = params.get("resolution", "480p")
-            sample_steps = params.get("sample_steps", 30)
+            sample_steps = params.get("sample_steps", 25)
             frame_num = params.get("frame_num", 81)
             output_path = params["output_path"]
-            
-            # Calculate max_area based on resolution
-            # 480p = 832x480, 720p = 1280x720
-            if resolution == "720p":
-                max_area = 1280 * 720
-                shift = 5.0
-            else:  # 480p
-                max_area = 832 * 480
-                shift = 3.0  # Recommended for 480p
-            
-            print(f"Generating video: {resolution}, {sample_steps} steps, {frame_num} frames")
-            print(f"Image: {image_path}")
-            print(f"Prompt: {prompt[:100]}...")
-            
-            # Print GPU memory before generation
-            if torch.cuda.is_available():
-                allocated = torch.cuda.memory_allocated() / 1024**3
-                reserved = torch.cuda.memory_reserved() / 1024**3
-                total = torch.cuda.get_device_properties(0).total_memory / 1024**3
-                print(f"GPU Memory before: {allocated:.1f}GB/{total:.1f}GB (reserved: {reserved:.1f}GB)")
-            
-            # Load image as PIL Image
-            img = Image.open(image_path).convert("RGB")
-            
-            # Clear CUDA cache before generation to free up memory
+
+            if resolution not in RESOLUTIONS:
+                raise ValueError(f"Unknown resolution '{resolution}'. Choose 480p or 720p.")
+
+            height, width, flow_shift = RESOLUTIONS[resolution]
+
+            image = Image.open(image_path).convert("RGB")
             torch.cuda.empty_cache()
-            
-            # Generate video using correct API
-            # offload_model=False keeps model in GPU (fast but needs VRAM)
-            # offload_model=True swaps to CPU (slow but saves VRAM)
-            # A100 80GB needs offload_model=True for 14B model
-            print(f"Starting generation with offload_model=True...", flush=True)
-            print(f"This will take 15-25 minutes with CPU offloading...", flush=True)
-            gen_start = time.time()
-            
-            try:
-                print(f"Calling pipe.generate()...", flush=True)
-                video = self.pipe.generate(
-                    input_prompt=prompt,
-                    img=img,
-                    max_area=max_area,
-                    frame_num=frame_num,
-                    shift=shift,
-                    sampling_steps=sample_steps,
-                    seed=int(time.time()) % 2**32,
-                    offload_model=True,  # Swap to CPU to avoid OOM (required for 14B model)
-                )
-                print(f"pipe.generate() returned", flush=True)
-                gen_elapsed = time.time() - gen_start
-                print(f"Generation completed in {gen_elapsed:.1f}s", flush=True)
-                
-                # Validate video output
-                if video is None:
-                    raise Exception("Generation returned None - model failed to produce output")
-                
-                print(f"Video tensor shape: {video.shape}, dtype: {video.dtype}", flush=True)
-                
-            except Exception as gen_error:
-                print(f"GENERATION ERROR: {gen_error}", flush=True)
-                traceback.print_exc()
-                sys.stdout.flush()
-                sys.stderr.flush()
-                # Print GPU state after error
-                if torch.cuda.is_available():
-                    allocated = torch.cuda.memory_allocated() / 1024**3
-                    reserved = torch.cuda.memory_reserved() / 1024**3
-                    print(f"GPU Memory after error: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved", flush=True)
-                raise gen_error
-            
-            # Clear cache after generation
-            print(f"Clearing CUDA cache...", flush=True)
+
+            print(f"Generating {resolution} ({width}x{height}), {frame_num} frames, {sample_steps} steps")
+
+            result = self.pipe(
+                image=image,
+                prompt=prompt,
+                height=height,
+                width=width,
+                num_frames=frame_num,
+                num_inference_steps=sample_steps,
+                guidance_scale=5.0,
+                flow_shift=flow_shift,
+            )
+            frames = result.frames[0]
+
             torch.cuda.empty_cache()
-            
-            # Save video using save_video (not cache_video which doesn't exist)
-            print(f"Saving video to {output_path}...", flush=True)
-            try:
-                from wan.utils.utils import save_video
-                print(f"Calling save_video...", flush=True)
-                save_video(
-                    tensor=video[None],
-                    save_file=output_path,
-                    fps=16,
-                    nrow=1,
-                    normalize=True,
-                    value_range=(-1, 1),
-                )
-                print(f"Video saved successfully", flush=True)
-                
-                # Verify file was created
-                import os
-                if not os.path.exists(output_path):
-                    raise Exception(f"Video file was not created at {output_path}")
-                
-                file_size = os.path.getsize(output_path)
-                print(f"Video file size: {file_size / 1024 / 1024:.2f} MB", flush=True)
-                
-            except Exception as save_error:
-                print(f"VIDEO SAVE ERROR: {save_error}", flush=True)
-                traceback.print_exc()
-                raise save_error
-            
-            gen_time = time.time() - start_time
-            print(f"✓ Video generated in {gen_time:.1f} seconds")
-            
+            export_to_video(frames, output_path, fps=16)
+
+            if not Path(output_path).exists():
+                raise RuntimeError(f"Video file was not created at {output_path}")
+
+            size_mb = Path(output_path).stat().st_size / 1024 / 1024
+            gen_time = time.time() - start
+            print(f"✓ Done in {gen_time:.1f}s — {size_mb:.1f} MB")
+
             return {
                 "success": True,
                 "output_path": output_path,
-                "generation_time": gen_time
+                "generation_time": gen_time,
+                "file_size_mb": round(size_mb, 2),
             }
-            
+
         except Exception as e:
             traceback.print_exc()
-            return {
-                "success": False,
-                "error": str(e)
-            }
-    
+            return {"success": False, "error": str(e)}
+
     def run(self):
-        """Run the model server, listening for requests"""
         import signal
-        
-        # Set up signal handlers to handle shutdown gracefully
-        def signal_handler(signum, frame):
-            print(f"Received signal {signum}, shutting down...")
+
+        def shutdown(signum, frame):
+            print(f"Signal {signum} received — shutting down")
             sys.exit(0)
-        
-        signal.signal(signal.SIGTERM, signal_handler)
-        signal.signal(signal.SIGINT, signal_handler)
-        
-        # Load model on startup
+
+        signal.signal(signal.SIGTERM, shutdown)
+        signal.signal(signal.SIGINT, shutdown)
+
         self.load_model()
-        
-        # Remove old socket if exists
+
         if os.path.exists(SOCKET_PATH):
             os.unlink(SOCKET_PATH)
-        
-        # Create Unix socket server
+
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server.bind(SOCKET_PATH)
         server.listen(1)
-        
-        # Make socket accessible
         os.chmod(SOCKET_PATH, 0o777)
-        
-        print(f"Model server listening on {SOCKET_PATH}")
-        print("Ready to receive jobs (model is warm!)")
-        
+
+        print(f"✓ Model server ready on {SOCKET_PATH}")
+
         while True:
+            conn = None
             try:
                 conn, _ = server.accept()
-                
-                # Receive request with timeout
-                conn.settimeout(5.0)  # 5 second timeout for receiving data
+                conn.settimeout(5.0)
+
                 data = b""
                 try:
                     while True:
@@ -287,58 +162,35 @@ class ModelServer:
                         if b"\n\n" in data:
                             break
                 except socket.timeout:
-                    # Timeout waiting for data - might be a health check
                     pass
-                
-                # Check for empty request (health check / connection test)
+
                 request_str = data.decode().strip()
                 if not request_str:
-                    # Empty request - just a connection test, close silently
                     conn.close()
                     continue
-                
-                # Parse request
+
                 request = json.loads(request_str)
-                print(f"\nReceived job request: {request.get('job_id', 'unknown')}")
-                
-                # Generate video
-                print(f"Processing generation request...", flush=True)
+                print(f"\nJob {request.get('job_id', 'unknown')}")
+
                 result = self.generate_video(request)
-                print(f"Generation result: success={result.get('success')}", flush=True)
-                if not result.get('success'):
-                    print(f"Error details: {result.get('error')}", flush=True)
-                else:
-                    print(f"Output path: {result.get('output_path')}", flush=True)
-                
-                # Send response
-                print(f"Sending response back to handler...", flush=True)
-                response = json.dumps(result) + "\n"
-                print(f"Response length: {len(response)} bytes", flush=True)
-                try:
-                    conn.sendall(response.encode())
-                    print(f"Response sent successfully", flush=True)
-                except Exception as send_error:
-                    print(f"Error sending response: {send_error}", flush=True)
-                finally:
-                    conn.close()
-                    print(f"Connection closed", flush=True)
-                
+
+                conn.sendall((json.dumps(result) + "\n").encode())
+
             except Exception as e:
                 print(f"Server error: {e}")
                 traceback.print_exc()
-                # Try to send error response
-                try:
-                    error_response = json.dumps({"success": False, "error": str(e)}) + "\n"
-                    conn.sendall(error_response.encode())
-                except:
-                    pass
-                finally:
+                if conn:
+                    try:
+                        conn.sendall((json.dumps({"success": False, "error": str(e)}) + "\n").encode())
+                    except Exception:
+                        pass
+            finally:
+                if conn:
                     try:
                         conn.close()
-                    except:
+                    except Exception:
                         pass
 
 
 if __name__ == "__main__":
-    server = ModelServer()
-    server.run()
+    ModelServer().run()

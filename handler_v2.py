@@ -1,9 +1,9 @@
 """
-RunPod Serverless Handler for Wan2.2 I2V (Image-to-Video)
-Version 2.0 - With Persistent Model Server for warm model between jobs
+RunPod Serverless Handler for Wan2.2-I2V-A14B-FP8
+Version 3.0 - FP8 model via diffusers, optimised for RTX 5090 (32 GB VRAM)
 
-Key improvement: Model loads ONCE on container startup and stays warm,
-eliminating the ~6 minute model load time for subsequent jobs.
+Model loads ONCE on container startup via persistent model server and stays
+warm between jobs, eliminating repeated load time.
 """
 # FIRST: Set CUDA environment variables before ANY imports
 import os
@@ -23,12 +23,9 @@ import requests
 from pathlib import Path
 from typing import Dict, Any
 from datetime import datetime
-from huggingface_hub import snapshot_download
 
 # Configuration
-MODEL_ID = "Wan-AI/Wan2.2-I2V-A14B"
-MODEL_CACHE_DIR = os.getenv("MODEL_CACHE_DIR", "/runpod-volume/models")
-WAN_DIR = "/workspace/Wan2.2"
+MODEL_PATH = os.getenv("MODEL_PATH", "/runpod-volume/models/wan22-i2v-fp8")
 SOCKET_PATH = "/tmp/wan2_model_server.sock"
 MODEL_SERVER_SCRIPT = "/workspace/handler/model_server.py"
 
@@ -49,26 +46,15 @@ RESOLUTION_MAP = {
 # Global state
 model_server_process = None
 
-def ensure_model_downloaded():
-    """Download model if not cached"""
-    model_dir = f"{MODEL_CACHE_DIR}/{MODEL_ID}"
-    required_file = Path(model_dir) / "models_t5_umt5-xxl-enc-bf16.pth"
-    
-    if not required_file.exists():
-        print(f"Downloading model (~11GB) to {model_dir}...")
-        os.makedirs(model_dir, exist_ok=True)
-        
-        os.environ["HF_HOME"] = model_dir
-        os.environ["HF_HUB_CACHE"] = model_dir
-        
-        snapshot_download(
-            repo_id=MODEL_ID,
-            local_dir=model_dir,
-            local_dir_use_symlinks=False,
+def verify_model_present():
+    """Confirm the FP8 model weights exist on the network volume"""
+    required = Path(MODEL_PATH) / "models_t5_umt5-xxl-enc-bf16.pth"
+    if not required.exists():
+        raise RuntimeError(
+            f"Model weights not found at {MODEL_PATH}. "
+            "Download nalexand/Wan2.2-I2V-A14B-FP8 to the network volume before starting."
         )
-        print("✓ Model downloaded")
-    else:
-        print("✓ Model found in cache")
+    print(f"✓ Model found at {MODEL_PATH}")
 
 def start_model_server():
     """Start the persistent model server as a background process"""
@@ -308,24 +294,13 @@ def generate_video(job: Dict[str, Any]) -> Dict[str, Any]:
 
 # Initialize on container startup
 print("=" * 60)
-print("Wan2.2 I2V Handler v2.0 - Warm Model Architecture")
+print("Wan2.2-I2V-A14B-FP8 Handler v3.0 — RTX 5090 / Diffusers")
 print("=" * 60)
 
-# Apply FlashAttention patches
-print("Applying FlashAttention compatibility patches...")
-from patches.apply_patches import apply_flashattention_patches, apply_i2v_only_patches
-apply_flashattention_patches()
-apply_i2v_only_patches()
-print("✓ Patches applied")
-
-# Ensure model is downloaded
-ensure_model_downloaded()
-
-# Start persistent model server (loads model into GPU)
+verify_model_present()
 start_model_server()
 
 print("✓ Handler ready with warm model!")
 print("=" * 60)
 
-# Start RunPod serverless handler
 runpod.serverless.start({"handler": generate_video})
