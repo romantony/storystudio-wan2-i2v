@@ -1,23 +1,25 @@
 #!/usr/bin/env python
 """
-Persistent Model Server for Wan2.2-I2V-A14B-FP8
-Native Wan2.2 code with custom per-block FP8 weight loader.
+Persistent Model Server for Wan2.2-I2V-A14B.
 
-The nalexand FP8 model stores DiT weights as one safetensors file per block
-(blocks.0.safetensors … blocks.39.safetensors, head.safetensors, etc.) with
-an empty weight_map in the index.json.  Standard WanModel.from_pretrained()
-loads nothing from this format, resulting in randomly-initialised weights.
+Supports two on-disk formats detected automatically via format.json:
 
-We let WanI2V load T5/VAE normally, then replace the DiT parameters by
-scanning all *.safetensors files in the _fp8 subdirectories, processing one
-shard (~300 MB FP8) at a time to avoid accumulating the full ~14 GB FP8
-state dict in CPU RAM.  Each shard is loaded, cast to BF16, assigned directly
-to the model parameter, then freed before the next shard is loaded.
+  OUR FP8 FORMAT (wan22-i2v-qfp8-v1) — preferred, produced by quantize_wan22_fp8.py
+  ─────────────────────────────────────────────────────────────────────────
+  • nn.Linear weights stored as float8_e4m3fn + per-tensor BF16 scale.
+  • Non-linear params (norms, embeddings, conv) kept as BF16.
+  • Per-block safetensors with ABSOLUTE keys.
+  • FP8Linear replaces nn.Linear at load time: weight stays FP8 on GPU,
+    dequantized to BF16 on-the-fly for each matmul (temporary, freed after).
+  • VRAM: both DiTs on GPU simultaneously (~14 GB FP8 each = ~28 GB total).
+    No CPU↔GPU offload needed during inference.
 
-After high_noise is fully loaded (BF16 on CPU), it is moved to GPU before
-low_noise is loaded, keeping peak CPU RAM around 40 GB instead of ~70 GB.
-With offload_model=True during generate(), only one 14B DiT (~28.6 GB BF16)
-resides on the GPU at a time, fitting within 32 GB VRAM.
+  NALEXAND FORMAT (fallback, BF16 path)
+  ─────────────────────────────────────
+  • Per-block safetensors with relative or absolute keys.  Empty weight_map.
+  • Weights streamed one shard at a time, cast FP8 → BF16, assigned directly.
+  • high_noise moved to GPU after loading to free CPU RAM for low_noise.
+  • VRAM: one DiT (~28.6 GB BF16) at a time; offload_model=True for inference.
 """
 import gc
 import os
@@ -27,6 +29,7 @@ import socket
 import time
 import traceback
 from pathlib import Path
+from typing import Optional
 
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
@@ -41,15 +44,108 @@ if WAN22_PATH not in sys.path:
 MODEL_PATH = os.getenv("MODEL_PATH", "/workspace/models/wan22-i2v-fp8")
 SOCKET_PATH = "/tmp/wan2_model_server.sock"
 
-# Resolution → (max_area, flow_shift)
 RESOLUTIONS = {
     "480p": (832 * 480, 3.0),
     "720p": (1280 * 720, 5.0),
 }
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# FP8Linear — our own FP8 inference wrapper
+# ════════════════════════════════════════════════════════════════════════════
+
+class FP8Linear:
+    """
+    Drop-in nn.Linear replacement that stores weight in float8_e4m3fn.
+
+    _fp8_w, _scale, _bias are plain Python attributes (not registered buffers/
+    parameters) so that Module.to(dtype=bf16) never silently casts the FP8
+    weight.  Device movement IS supported via the _apply() override, which
+    propagates device changes while preserving the FP8 dtype.
+
+    Forward: dequantize weight to input dtype, run F.linear, discard BF16 copy.
+    Memory:  FP8 weight lives on GPU, BF16 copy is ~single-layer transient.
+    """
+
+    def __init__(self, fp8_w: "torch.Tensor", scale: "torch.Tensor",
+                 bias: Optional["torch.Tensor"] = None):
+        # Delay nn.Module import — model_server may be imported before torch
+        import torch.nn as nn
+        # We subclass nn.Module inline to get module registration
+        if not isinstance(self, nn.Module):
+            raise TypeError("FP8Linear must be used as a mixin with nn.Module")
+        self._fp8_w = fp8_w
+        self._scale  = scale
+        self._bias   = bias
+
+    def _apply(self, fn, recurse=True):
+        """Called by Module.to() / .cuda() / .cpu() — move tensors to new device."""
+        self._scale = fn(self._scale)
+        if self._bias is not None:
+            self._bias = fn(self._bias)
+        # Apply fn to FP8 weight but preserve its dtype.
+        result = fn(self._fp8_w)
+        if result.dtype == self._fp8_w.dtype:
+            self._fp8_w = result                        # device-only change: safe
+        else:
+            self._fp8_w = self._fp8_w.to(result.device) # fn tried to cast dtype: keep FP8, just move device
+        return self
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        import torch.nn.functional as F
+        w = self._fp8_w.to(x.dtype) * self._scale      # BF16 weight, freed after matmul
+        return F.linear(x, w, self._bias)
+
+    def extra_repr(self) -> str:
+        return (f"in={self._fp8_w.shape[1]}, out={self._fp8_w.shape[0]}, "
+                f"bias={self._bias is not None}, weight=fp8_e4m3fn")
+
+
+def _make_fp8_linear_class() -> type:
+    """Return a class that is both nn.Module and FP8Linear (avoids top-level import)."""
+    import torch.nn as nn
+
+    class _FP8Linear(FP8Linear, nn.Module):
+        def __init__(self, fp8_w, scale, bias=None):
+            nn.Module.__init__(self)
+            FP8Linear.__init__(self, fp8_w, scale, bias)
+
+        def _apply(self, fn, recurse=True):
+            return FP8Linear._apply(self, fn, recurse)
+
+        def forward(self, x):
+            return FP8Linear.forward(self, x)
+
+        def extra_repr(self):
+            return FP8Linear.extra_repr(self)
+
+    return _FP8Linear
+
+
+_FP8LinearClass = None   # created lazily after torch is imported
+
+
+def _fp8_linear_cls():
+    global _FP8LinearClass
+    if _FP8LinearClass is None:
+        _FP8LinearClass = _make_fp8_linear_class()
+    return _FP8LinearClass
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Shared parameter-navigation helper
+# ════════════════════════════════════════════════════════════════════════════
+
+def _get_module(model: "torch.nn.Module", key: str) -> "torch.nn.Module":
+    """Navigate to the sub-module named by key (dot-separated path)."""
+    m = model
+    for part in key.split('.'):
+        m = getattr(m, part)
+    return m
+
+
 def _assign_param(model: "torch.nn.Module", key: str, value: "torch.Tensor") -> None:
-    """Replace a model parameter by navigating the module hierarchy via its state-dict key."""
+    """Replace a model parameter at state-dict key with value tensor."""
     import torch
     parts = key.split('.')
     module = model
@@ -58,18 +154,105 @@ def _assign_param(model: "torch.nn.Module", key: str, value: "torch.Tensor") -> 
     setattr(module, parts[-1], torch.nn.Parameter(value, requires_grad=False))
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# OUR FP8 FORMAT LOADER
+# ════════════════════════════════════════════════════════════════════════════
+
+def _load_our_fp8_model(model, block_dir: str) -> None:
+    """
+    Load our quantize_wan22_fp8.py output into a WanModel.
+
+    For each shard file:
+      - Tensors with dtype float8_e4m3fn paired with a companion .weight.scale
+        → the parent nn.Linear is replaced with an FP8Linear (stays FP8 on GPU).
+      - All other tensors → assigned as BF16 parameters.
+
+    Processing is shard-by-shard so peak extra RAM during loading is ~one shard
+    (~0.3 GB FP8) regardless of the total model size.
+    """
+    import torch
+    from safetensors.torch import load_file
+    Cls = _fp8_linear_cls()
+
+    block_dir_path = Path(block_dir)
+    shard_files = sorted(block_dir_path.glob("*.safetensors"))
+    if not shard_files:
+        raise RuntimeError(f"No safetensors files found in {block_dir}")
+
+    total_loaded = 0
+    total_fp8    = 0
+    total_bf16   = 0
+
+    for shard_file in shard_files:
+        tensors = load_file(str(shard_file))
+
+        # Identify which base keys have a companion .scale (these are FP8 weights)
+        fp8_weight_keys = {
+            k for k in tensors
+            if not k.endswith('.scale') and f"{k}.scale" in tensors
+        }
+        # Bias keys that belong to FP8 linear layers (handled alongside weight)
+        fp8_bias_keys = {
+            k for k in tensors
+            if not k.endswith('.scale')
+            and k.endswith('.bias')
+            and k[:-len('.bias')] + '.weight' in fp8_weight_keys
+        }
+
+        for key, tensor in tensors.items():
+            if key.endswith('.scale'):
+                continue                    # processed below alongside the weight
+
+            if key in fp8_weight_keys:
+                # --- FP8 linear weight: replace the nn.Linear with FP8Linear ---
+                scale     = tensors[f"{key}.scale"]
+                bias_key  = key[:-len('.weight')] + '.bias'
+                bias      = tensors.get(bias_key, None)
+                if bias is not None:
+                    bias = bias.to(torch.bfloat16)
+
+                fp8_linear = Cls(tensor, scale, bias)   # tensor stays float8_e4m3fn
+
+                # Navigate to parent module and replace
+                parent_path, leaf = key.rsplit('.', 1)  # leaf == 'weight'
+                module_path = parent_path               # e.g. 'blocks.0.self_attn.q'
+                grandparent_path, module_name = (
+                    module_path.rsplit('.', 1) if '.' in module_path
+                    else ('', module_path)
+                )
+                if grandparent_path:
+                    grandparent = _get_module(model, grandparent_path)
+                else:
+                    grandparent = model
+                setattr(grandparent, module_name, fp8_linear)
+                total_fp8  += 1
+                total_loaded += 1
+
+            elif key in fp8_bias_keys:
+                continue                    # already handled in the weight block above
+
+            else:
+                # --- BF16 parameter ---
+                _assign_param(model, key, tensor.to(torch.bfloat16))
+                total_bf16   += 1
+                total_loaded += 1
+
+        del tensors
+        gc.collect()
+
+    print(f"    {Path(block_dir).name}: "
+          f"{total_loaded} loaded ({total_fp8} FP8 linears, {total_bf16} BF16 params)")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# NALEXAND FORMAT LOADER  (BF16 fallback)
+# ════════════════════════════════════════════════════════════════════════════
+
 def _load_perblock_weights(model, block_dir: str) -> None:
     """
-    Stream-load nalexand per-block safetensors directly into model parameters.
-
-    Each *.safetensors shard (~300 MB FP8) is loaded, cast to BF16, and assigned
-    parameter-by-parameter to the model before the next shard is loaded.  This keeps
-    peak extra CPU RAM per shard to ~1 GB instead of accumulating a full 14 GB FP8
-    state dict — which would cause OOM when loading the second DiT on top of the first.
-
-    Keys inside each shard file may be relative ('self_attn.q.weight') or absolute
-    ('blocks.0.self_attn.q.weight').  We resolve by checking the model's own state_dict
-    keys with the file stem as prefix, then fall back to the raw key directly.
+    Stream-load nalexand per-block safetensors → BF16.
+    One shard at a time to keep peak CPU RAM ~1 GB per shard.
+    Keys may be relative (self_attn.q.weight) or absolute (blocks.0.self_attn.q.weight).
     """
     import torch
     from safetensors.torch import load_file
@@ -79,17 +262,16 @@ def _load_perblock_weights(model, block_dir: str) -> None:
     if not shard_files:
         raise RuntimeError(f"No safetensors files found in {block_dir}")
 
-    model_keys = set(model.state_dict().keys())
-    loaded = 0
-    missing_keys = set(model_keys)
+    model_keys    = set(model.state_dict().keys())
+    loaded        = 0
+    missing_keys  = set(model_keys)
     unexpected_keys = []
 
     for shard_file in shard_files:
-        module_prefix = shard_file.stem   # e.g. 'blocks.0', 'head', 'patch_embedding'
+        module_prefix = shard_file.stem
         tensors = load_file(str(shard_file))
 
         for raw_key, tensor in tensors.items():
-            # Resolve key: try module_prefix.raw_key first (handles relative keys)
             candidate_abs = f"{module_prefix}.{raw_key}"
             if candidate_abs in model_keys:
                 abs_key = candidate_abs
@@ -99,29 +281,30 @@ def _load_perblock_weights(model, block_dir: str) -> None:
                 unexpected_keys.append(candidate_abs)
                 continue
 
-            # Cast FP8 → BF16, assign directly, then let the shard-level del free FP8
-            bf16_tensor = tensor.to(torch.bfloat16)
-            _assign_param(model, abs_key, bf16_tensor)
+            _assign_param(model, abs_key, tensor.to(torch.bfloat16))
             missing_keys.discard(abs_key)
             loaded += 1
 
-        # Free the entire FP8 shard before moving to the next one
         del tensors
         gc.collect()
 
     missing = len(missing_keys)
-    extra = len(unexpected_keys)
+    extra   = len(unexpected_keys)
     print(f"    {Path(block_dir).name}: {loaded} loaded, {missing} missing, {extra} unexpected")
-
     if missing_keys:
         print(f"    First 5 missing: {list(missing_keys)[:5]}")
     if unexpected_keys:
         print(f"    First 5 unexpected: {unexpected_keys[:5]}")
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# Model server
+# ════════════════════════════════════════════════════════════════════════════
+
 class ModelServer:
     def __init__(self):
         self.pipe = None
+        self.using_fp8_format = False
 
     def load_model(self):
         import torch
@@ -134,27 +317,36 @@ class ModelServer:
         print(f"VRAM: {vram_gb:.1f} GB")
 
         if not Path(MODEL_PATH).exists():
-            raise RuntimeError(
-                f"Model not found at {MODEL_PATH}. "
-                "Download nalexand/Wan2.2-I2V-A14B-FP8 to the network volume first."
-            )
+            raise RuntimeError(f"Model not found at {MODEL_PATH}.")
+
+        # Detect format
+        fmt_file = Path(MODEL_PATH) / 'format.json'
+        if fmt_file.exists():
+            fmt = json.loads(fmt_file.read_text())
+            if fmt.get('format') == 'wan22-i2v-qfp8-v1':
+                self.using_fp8_format = True
+                high_noise_dir = fmt.get('high_noise_dir', 'high_noise_model')
+                low_noise_dir  = fmt.get('low_noise_dir',  'low_noise_model')
+                print("Format: our FP8 (float8_e4m3fn + per-tensor scale) — both DiTs on GPU")
+            else:
+                raise RuntimeError(f"Unknown format: {fmt.get('format')}")
+        else:
+            self.using_fp8_format = False
+            high_noise_dir = 'high_noise_model_fp8'
+            low_noise_dir  = 'low_noise_model_fp8'
+            print("Format: nalexand per-block FP8 → BF16 (fallback path)")
 
         print(f"Loading model from {MODEL_PATH} ...")
         start = time.time()
 
         cfg = WAN_CONFIGS['i2v-A14B']
-        cfg.high_noise_checkpoint = 'high_noise_model_fp8'
-        cfg.low_noise_checkpoint  = 'low_noise_model_fp8'
+        cfg.high_noise_checkpoint = high_noise_dir
+        cfg.low_noise_checkpoint  = low_noise_dir
 
-        # Suppress verbose "Some weights not initialized" warnings from diffusers/transformers —
-        # expected because the per-block FP8 index.json has an empty weight_map.
         import logging
         logging.getLogger("diffusers").setLevel(logging.ERROR)
         logging.getLogger("transformers").setLevel(logging.ERROR)
 
-        # WanI2V correctly loads T5 and VAE.
-        # DiT models get architecture-only (meta device) because the per-block
-        # safetensors format has an empty weight_map in the index.json.
         self.pipe = WanI2V(
             config=cfg,
             checkpoint_dir=MODEL_PATH,
@@ -163,34 +355,55 @@ class ModelServer:
             t5_fsdp=False,
             dit_fsdp=False,
             use_sp=False,
-            t5_cpu=True,           # T5 (11.4 GB) stays on CPU
-            init_on_cpu=True,
+            t5_cpu=True,
+            init_on_cpu=True,           # DiTs start on meta device
             convert_model_dtype=False,
         )
 
-        # Stream-load FP8 weights one shard at a time into each DiT.
-        # After high_noise is fully loaded to CPU as BF16, move it to GPU to free
-        # CPU RAM before loading low_noise (avoids ~71 GB peak → ~40 GB peak).
-        print("Loading FP8 DiT weights (per-block format) → BF16 ...")
-        for attr, subdir in [
-            ('high_noise_model', 'high_noise_model_fp8'),
-            ('low_noise_model',  'low_noise_model_fp8'),
-        ]:
-            model = getattr(self.pipe, attr)
-            block_dir = os.path.join(MODEL_PATH, subdir)
-            _load_perblock_weights(model, block_dir)   # BF16 params on CPU
+        if self.using_fp8_format:
+            self._load_our_fp8(high_noise_dir, low_noise_dir)
+        else:
+            self._load_nalexand_fp8(high_noise_dir, low_noise_dir)
 
-            if attr == 'high_noise_model':
-                # Move to GPU now so CPU RAM is free for low_noise loading.
-                # offload_model=True in generate() handles swapping during inference.
-                print("    Moving high_noise_model to GPU ...")
-                model.to(torch.device('cuda', 0))
-                gc.collect()
-
-        elapsed = time.time() - start
+        elapsed   = time.time() - start
         allocated = torch.cuda.memory_allocated() / 1024**3
         reserved  = torch.cuda.memory_reserved()  / 1024**3
         print(f"✓ Model ready in {elapsed:.1f}s — {allocated:.1f} GB alloc / {reserved:.1f} GB reserved")
+
+    def _load_our_fp8(self, high_noise_dir: str, low_noise_dir: str) -> None:
+        """FP8 path: load both DiTs directly onto GPU as FP8.  No offload needed."""
+        import torch
+
+        print("Loading DiT weights (our FP8 format) → FP8 on GPU ...")
+        for attr, subdir in [
+            ('high_noise_model', high_noise_dir),
+            ('low_noise_model',  low_noise_dir),
+        ]:
+            model     = getattr(self.pipe, attr)
+            block_dir = os.path.join(MODEL_PATH, subdir)
+            _load_our_fp8_model(model, block_dir)
+            model.to(torch.device('cuda', 0))   # move FP8 + BF16 buffers to GPU
+
+        vram_gb = torch.cuda.memory_allocated() / 1024**3
+        print(f"    Both DiTs on GPU: {vram_gb:.1f} GB VRAM used")
+
+    def _load_nalexand_fp8(self, high_noise_dir: str, low_noise_dir: str) -> None:
+        """Nalexand fallback: stream FP8 → BF16.  Move high_noise to GPU to free CPU RAM."""
+        import torch
+
+        print("Loading DiT weights (nalexand per-block format) → BF16 ...")
+        for attr, subdir in [
+            ('high_noise_model', high_noise_dir),
+            ('low_noise_model',  low_noise_dir),
+        ]:
+            model     = getattr(self.pipe, attr)
+            block_dir = os.path.join(MODEL_PATH, subdir)
+            _load_perblock_weights(model, block_dir)
+
+            if attr == 'high_noise_model':
+                print("    Moving high_noise_model to GPU ...")
+                model.to(torch.device('cuda', 0))
+                gc.collect()
 
     def generate_video(self, params: dict) -> dict:
         import torch
@@ -211,14 +424,15 @@ class ModelServer:
                 raise ValueError(f"Unknown resolution '{resolution}'. Choose 480p or 720p.")
 
             max_area, flow_shift = RESOLUTIONS[resolution]
-
             image = Image.open(image_path).convert("RGB")
             torch.cuda.empty_cache()
 
             print(f"Generating {resolution} (max_area={max_area}), {frame_num} frames, {sample_steps} steps")
 
-            # generate() returns (C, N, H, W) tensor in range [-1, 1].
-            # offload_model=True swaps the inactive DiT to CPU during sampling.
+            # FP8 path: both DiTs already on GPU, no offload needed.
+            # Nalexand path: offload_model=True swaps the inactive DiT to CPU.
+            offload = not self.using_fp8_format
+
             video_tensor = self.pipe.generate(
                 input_prompt=prompt,
                 img=image,
@@ -230,10 +444,10 @@ class ModelServer:
                 guide_scale=5.0,
                 n_prompt="",
                 seed=-1,
-                offload_model=True,
+                offload_model=offload,
             )
 
-            # Convert (C, N, H, W) [-1,1] → (N, H, W, C) uint8
+            # (C, N, H, W) [-1,1] → (N, H, W, C) uint8
             frames = (video_tensor.clamp(-1, 1) + 1) / 2
             frames = frames.permute(1, 2, 3, 0).cpu().float().numpy()
             frames = (frames * 255).astype(np.uint8)
