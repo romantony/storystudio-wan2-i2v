@@ -225,8 +225,8 @@ def generate_video(job: Dict[str, Any]) -> Dict[str, Any]:
         if resolution not in RESOLUTION_MAP:
             return {"error": f"Invalid resolution. Must be one of: {list(RESOLUTION_MAP.keys())}"}
         
-        if not (15 <= sample_steps <= 50):
-            return {"error": "sample_steps must be between 15 and 50"}
+        if not (4 <= sample_steps <= 50):
+            return {"error": "sample_steps must be between 4 and 50"}
         
         if not (17 <= frame_num <= 161):
             return {"error": "frame_num must be between 17 and 161"}
