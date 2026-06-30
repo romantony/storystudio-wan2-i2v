@@ -4,8 +4,8 @@ FROM runpod/pytorch:1.0.7-cu1290-torch260-ubuntu2204
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    MODEL_PATH=/workspace/wan22-qfp8 \
-    HF_HOME=/workspace/huggingface \
+    MODEL_PATH=/runpod-volume/wan22-qfp8 \
+    HF_HOME=/runpod-volume/huggingface \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,7 +24,8 @@ WORKDIR /workspace
 # WanS2V (needs decord), WanT2V, WanTI2V, and WanAnimate — none used here.
 RUN git clone --depth 1 https://github.com/Wan-Video/Wan2.2.git /workspace/wan22 && \
     printf '# trimmed for i2v-only usage\nfrom . import configs, distributed, modules\nfrom .image2video import WanI2V\n' \
-    > /workspace/wan22/wan/__init__.py
+    > /workspace/wan22/wan/__init__.py && \
+    sed -i 's/device=torch\.cuda\.current_device()/device=0/g' /workspace/wan22/wan/modules/t5.py
 
 RUN python3 -m pip install --no-cache-dir \
     transformers==4.51.3 \

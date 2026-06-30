@@ -41,7 +41,7 @@ WAN22_PATH = "/workspace/wan22"
 if WAN22_PATH not in sys.path:
     sys.path.insert(0, WAN22_PATH)
 
-MODEL_PATH = os.getenv("MODEL_PATH", "/workspace/wan22-qfp8")
+MODEL_PATH = os.getenv("MODEL_PATH", "/runpod-volume/wan22-qfp8")
 SOCKET_PATH = "/tmp/wan2_model_server.sock"
 
 RESOLUTIONS = {
