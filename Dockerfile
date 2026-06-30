@@ -25,7 +25,14 @@ WORKDIR /workspace
 RUN git clone --depth 1 https://github.com/Wan-Video/Wan2.2.git /workspace/wan22 && \
     printf '# trimmed for i2v-only usage\nfrom . import configs, distributed, modules\nfrom .image2video import WanI2V\n' \
     > /workspace/wan22/wan/__init__.py && \
-    sed -i 's/device=torch\.cuda\.current_device()/device=0/g' /workspace/wan22/wan/modules/t5.py
+    sed -i 's/device=torch\.cuda\.current_device()/device=0/g' /workspace/wan22/wan/modules/t5.py && \
+    # FlashAttention is not installed (does not build on these images). Route every
+    # `flash_attention` import to attention(), which has a PyTorch SDPA fallback.
+    grep -rl 'import flash_attention' /workspace/wan22/wan | \
+    xargs -r sed -i \
+      -e 's/from \.attention import flash_attention/from .attention import attention as flash_attention/g' \
+      -e 's/from \.\.modules\.attention import flash_attention/from ..modules.attention import attention as flash_attention/g' \
+      -e 's/from wan\.modules\.attention import flash_attention/from wan.modules.attention import attention as flash_attention/g'
 
 RUN python3 -m pip install --no-cache-dir \
     transformers==4.51.3 \

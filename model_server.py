@@ -301,10 +301,16 @@ def _load_perblock_weights(model, block_dir: str) -> None:
 # Model server
 # ════════════════════════════════════════════════════════════════════════════
 
+# Cards with at least this much total VRAM keep both FP8 DiTs (~27 GB) resident
+# on the GPU. Smaller cards (e.g. 32 GB RTX 5090) page one DiT at a time.
+RESIDENT_VRAM_THRESHOLD_GB = 40
+
+
 class ModelServer:
     def __init__(self):
         self.pipe = None
         self.using_fp8_format = False
+        self.keep_resident = False   # set in load_model from detected VRAM
 
     def load_model(self):
         import torch
@@ -314,7 +320,9 @@ class ModelServer:
         print(f"PyTorch {torch.__version__} | CUDA {torch.version.cuda}")
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        print(f"VRAM: {vram_gb:.1f} GB")
+        self.keep_resident = vram_gb >= RESIDENT_VRAM_THRESHOLD_GB
+        print(f"VRAM: {vram_gb:.1f} GB → "
+              f"{'both DiTs resident on GPU' if self.keep_resident else 'offload one DiT at a time'}")
 
         if not Path(MODEL_PATH).exists():
             raise RuntimeError(f"Model not found at {MODEL_PATH}.")
@@ -386,11 +394,11 @@ class ModelServer:
 
         if self.using_fp8_format:
             self._load_our_fp8(high_noise_dir, low_noise_dir)
-            # Keep init_on_cpu=True so WanI2V._prepare_model_for_timestep pages
-            # the active DiT onto the GPU and the inactive one back to CPU. Two
-            # FP8 DiTs (~27 GB) + VAE + activations do NOT fit on a 31 GB card,
-            # so we run one DiT (~13.6 GB) on the GPU at a time.
-            self.pipe.init_on_cpu = True
+            # On a big card both DiTs stay resident → disable WanI2V's per-step
+            # CPU<->GPU paging. On a small card keep init_on_cpu=True so
+            # _prepare_model_for_timestep pages the active DiT in and the
+            # inactive one out (two FP8 DiTs + VAE won't fit on ~32 GB).
+            self.pipe.init_on_cpu = not self.keep_resident
         else:
             self._load_nalexand_fp8(high_noise_dir, low_noise_dir)
 
@@ -400,11 +408,13 @@ class ModelServer:
         print(f"✓ Model ready in {elapsed:.1f}s — {allocated:.1f} GB alloc / {reserved:.1f} GB reserved")
 
     def _load_our_fp8(self, high_noise_dir: str, low_noise_dir: str) -> None:
-        """FP8 path: load both DiTs as FP8 on CPU. _prepare_model_for_timestep
-        pages the active DiT onto the GPU at inference time (one at a time)."""
+        """FP8 path. On big cards (keep_resident) both DiTs move to the GPU and
+        stay there. On small cards they stay on CPU and WanI2V pages the active
+        one onto the GPU at inference time (one at a time)."""
         import torch
 
-        print("Loading DiT weights (our FP8 format) → FP8 on CPU (paged to GPU per step) ...")
+        dest = "GPU (resident)" if self.keep_resident else "CPU (paged to GPU per step)"
+        print(f"Loading DiT weights (our FP8 format) → FP8 on {dest} ...")
         for attr, subdir in [
             ('high_noise_model', high_noise_dir),
             ('low_noise_model',  low_noise_dir),
@@ -412,9 +422,14 @@ class ModelServer:
             model     = getattr(self.pipe, attr)
             block_dir = os.path.join(MODEL_PATH, subdir)
             _load_our_fp8_model(model, block_dir)
-            # Stays on CPU; WanI2V moves it to GPU when its turn comes.
+            if self.keep_resident:
+                model.to(torch.device('cuda', 0))   # move FP8 + BF16 buffers to GPU
 
-        print("    Both DiTs loaded (FP8 on CPU); active DiT paged to GPU at inference")
+        if self.keep_resident:
+            vram_gb = torch.cuda.memory_allocated() / 1024**3
+            print(f"    Both DiTs resident on GPU: {vram_gb:.1f} GB VRAM used")
+        else:
+            print("    Both DiTs loaded (FP8 on CPU); active DiT paged to GPU at inference")
 
     def _load_nalexand_fp8(self, high_noise_dir: str, low_noise_dir: str) -> None:
         """Nalexand fallback: stream FP8 → BF16.  Move high_noise to GPU to free CPU RAM."""
@@ -458,10 +473,10 @@ class ModelServer:
 
             print(f"Generating {resolution} (max_area={max_area}), {frame_num} frames, {sample_steps} steps")
 
-            # Both paths offload the inactive DiT to CPU during the diffusion
-            # loop. Two FP8 DiTs (~27 GB) won't coexist with the VAE +
-            # activations on a 31 GB card, so we page one DiT at a time.
-            offload = True
+            # On a big card both DiTs are resident, so no offload. On a small
+            # card offload the inactive DiT to CPU during the diffusion loop —
+            # two FP8 DiTs (~27 GB) won't coexist with the VAE + activations.
+            offload = not self.keep_resident
 
             video_tensor = self.pipe.generate(
                 input_prompt=prompt,
