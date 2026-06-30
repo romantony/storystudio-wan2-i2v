@@ -386,11 +386,11 @@ class ModelServer:
 
         if self.using_fp8_format:
             self._load_our_fp8(high_noise_dir, low_noise_dir)
-            # Both DiTs are resident on GPU. Disable WanI2V's per-timestep
-            # CPU<->GPU offload (gated on init_on_cpu) so they stay put — the
-            # whole point of the FP8 path. generate() is also called with
-            # offload_model=False, so _prepare_model_for_timestep becomes a no-op.
-            self.pipe.init_on_cpu = False
+            # Keep init_on_cpu=True so WanI2V._prepare_model_for_timestep pages
+            # the active DiT onto the GPU and the inactive one back to CPU. Two
+            # FP8 DiTs (~27 GB) + VAE + activations do NOT fit on a 31 GB card,
+            # so we run one DiT (~13.6 GB) on the GPU at a time.
+            self.pipe.init_on_cpu = True
         else:
             self._load_nalexand_fp8(high_noise_dir, low_noise_dir)
 
@@ -400,10 +400,11 @@ class ModelServer:
         print(f"✓ Model ready in {elapsed:.1f}s — {allocated:.1f} GB alloc / {reserved:.1f} GB reserved")
 
     def _load_our_fp8(self, high_noise_dir: str, low_noise_dir: str) -> None:
-        """FP8 path: load both DiTs directly onto GPU as FP8.  No offload needed."""
+        """FP8 path: load both DiTs as FP8 on CPU. _prepare_model_for_timestep
+        pages the active DiT onto the GPU at inference time (one at a time)."""
         import torch
 
-        print("Loading DiT weights (our FP8 format) → FP8 on GPU ...")
+        print("Loading DiT weights (our FP8 format) → FP8 on CPU (paged to GPU per step) ...")
         for attr, subdir in [
             ('high_noise_model', high_noise_dir),
             ('low_noise_model',  low_noise_dir),
@@ -411,10 +412,9 @@ class ModelServer:
             model     = getattr(self.pipe, attr)
             block_dir = os.path.join(MODEL_PATH, subdir)
             _load_our_fp8_model(model, block_dir)
-            model.to(torch.device('cuda', 0))   # move FP8 + BF16 buffers to GPU
+            # Stays on CPU; WanI2V moves it to GPU when its turn comes.
 
-        vram_gb = torch.cuda.memory_allocated() / 1024**3
-        print(f"    Both DiTs on GPU: {vram_gb:.1f} GB VRAM used")
+        print("    Both DiTs loaded (FP8 on CPU); active DiT paged to GPU at inference")
 
     def _load_nalexand_fp8(self, high_noise_dir: str, low_noise_dir: str) -> None:
         """Nalexand fallback: stream FP8 → BF16.  Move high_noise to GPU to free CPU RAM."""
@@ -458,9 +458,10 @@ class ModelServer:
 
             print(f"Generating {resolution} (max_area={max_area}), {frame_num} frames, {sample_steps} steps")
 
-            # FP8 path: both DiTs already on GPU, no offload needed.
-            # Nalexand path: offload_model=True swaps the inactive DiT to CPU.
-            offload = not self.using_fp8_format
+            # Both paths offload the inactive DiT to CPU during the diffusion
+            # loop. Two FP8 DiTs (~27 GB) won't coexist with the VAE +
+            # activations on a 31 GB card, so we page one DiT at a time.
+            offload = True
 
             video_tensor = self.pipe.generate(
                 input_prompt=prompt,
