@@ -4,7 +4,7 @@ FROM runpod/pytorch:1.0.7-cu1290-torch260-ubuntu2204
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    MODEL_PATH=/workspace/models/wan22-i2v-fp8 \
+    MODEL_PATH=/workspace/wan22-qfp8 \
     HF_HOME=/workspace/huggingface \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
