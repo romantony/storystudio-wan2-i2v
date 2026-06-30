@@ -65,7 +65,18 @@ class FP8Linear:
 
     Forward: dequantize weight to input dtype, run F.linear, discard BF16 copy.
     Memory:  FP8 weight lives on GPU, BF16 copy is ~single-layer transient.
+
+    Dequant caching (optional): when cache_enabled, the BF16 weight is computed
+    once and kept (in addition to the FP8 source) so subsequent steps skip the
+    FP8->BF16 conversion. A class-level byte budget caps total cached memory so
+    it can never OOM — once the budget is hit, remaining layers dequant per-step
+    as before. Configured by ModelServer based on free VRAM after load.
     """
+
+    # Class-level dequant-cache controls (set by ModelServer._configure_dequant_cache)
+    cache_enabled: bool = False
+    cache_budget_bytes: int = 0
+    cache_used_bytes: int = 0
 
     def __init__(self, fp8_w: "torch.Tensor", scale: "torch.Tensor",
                  bias: Optional["torch.Tensor"] = None):
@@ -77,6 +88,7 @@ class FP8Linear:
         self._fp8_w = fp8_w
         self._scale  = scale
         self._bias   = bias
+        self._cached_w = None      # populated lazily in forward when caching is on
 
     def _apply(self, fn, recurse=True):
         """Called by Module.to() / .cuda() / .cpu() — move tensors to new device."""
@@ -93,7 +105,18 @@ class FP8Linear:
 
     def forward(self, x: "torch.Tensor") -> "torch.Tensor":
         import torch.nn.functional as F
-        w = self._fp8_w.to(x.dtype) * self._scale      # BF16 weight, freed after matmul
+        w = self._cached_w
+        if w is None or w.dtype != x.dtype:
+            w_new = self._fp8_w.to(x.dtype) * self._scale   # dequantized BF16 weight
+            # Cache it (once) if caching is on, the weight is on GPU, and the
+            # class-wide byte budget still has room. Otherwise it stays transient.
+            if (self._cached_w is None and FP8Linear.cache_enabled
+                    and self._fp8_w.device.type == 'cuda'):
+                nbytes = w_new.element_size() * w_new.nelement()
+                if FP8Linear.cache_used_bytes + nbytes <= FP8Linear.cache_budget_bytes:
+                    self._cached_w = w_new
+                    FP8Linear.cache_used_bytes += nbytes
+            w = w_new
         return F.linear(x, w, self._bias)
 
     def extra_repr(self) -> str:
@@ -318,6 +341,11 @@ class ModelServer:
         from wan.configs import WAN_CONFIGS
 
         print(f"PyTorch {torch.__version__} | CUDA {torch.version.cuda}")
+        try:
+            import flash_attn
+            print(f"FlashAttention 2 available: v{flash_attn.__version__} (real flash kernel)")
+        except Exception:
+            print("FlashAttention NOT installed — attention falls back to PyTorch SDPA")
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
         self.keep_resident = vram_gb >= RESIDENT_VRAM_THRESHOLD_GB
@@ -399,13 +427,75 @@ class ModelServer:
             # _prepare_model_for_timestep pages the active DiT in and the
             # inactive one out (two FP8 DiTs + VAE won't fit on ~32 GB).
             self.pipe.init_on_cpu = not self.keep_resident
+            if self.keep_resident:
+                self._configure_dequant_cache()
         else:
             self._load_nalexand_fp8(high_noise_dir, low_noise_dir)
+
+        self._instrument_timing()
 
         elapsed   = time.time() - start
         allocated = torch.cuda.memory_allocated() / 1024**3
         reserved  = torch.cuda.memory_reserved()  / 1024**3
         print(f"✓ Model ready in {elapsed:.1f}s — {allocated:.1f} GB alloc / {reserved:.1f} GB reserved")
+
+    def _configure_dequant_cache(self) -> None:
+        """Enable the FP8Linear dequant cache sized to fit in free VRAM.
+
+        Caching the BF16 weight skips the per-step FP8->BF16 conversion. We cap
+        total cached bytes at (free_vram - reserve) so activations + VAE still
+        fit and we never OOM. On a 48 GB card this caches a portion of the
+        weights; on bigger cards it caches more (near-all on 80 GB)."""
+        import torch
+        mode = os.getenv("DEQUANT_CACHE", "auto").lower()
+        if mode == "off":
+            FP8Linear.cache_enabled = False
+            print("    Dequant cache: off (DEQUANT_CACHE=off)")
+            return
+        free, _total = torch.cuda.mem_get_info()
+        free_gb = free / 1024**3
+        reserve_gb = float(os.getenv("DEQUANT_CACHE_RESERVE_GB", "14"))
+        budget_gb = max(0.0, free_gb - reserve_gb)
+        FP8Linear.cache_used_bytes = 0
+        FP8Linear.cache_budget_bytes = int(budget_gb * 1024**3)
+        FP8Linear.cache_enabled = budget_gb > 0.5
+        print(f"    Dequant cache: {'on' if FP8Linear.cache_enabled else 'off'} — "
+              f"free {free_gb:.1f} GB, reserve {reserve_gb:.0f} GB, cache budget {budget_gb:.1f} GB")
+
+    def _instrument_timing(self) -> None:
+        """Wrap T5 encode and VAE encode/decode to record per-phase durations,
+        so generate_video can report where time goes (loop vs T5 vs VAE)."""
+        self._timings = {'t5': 0.0, 'vae_encode': 0.0, 'vae_decode': 0.0}
+        server = self
+
+        # VAE encode/decode are regular methods → wrap on the instance.
+        vae = self.pipe.vae
+        _oenc, _odec = vae.encode, vae.decode
+
+        def _timed_encode(*a, **k):
+            s = time.time(); r = _oenc(*a, **k)
+            server._timings['vae_encode'] += time.time() - s
+            return r
+
+        def _timed_decode(*a, **k):
+            s = time.time(); r = _odec(*a, **k)
+            server._timings['vae_decode'] += time.time() - s
+            return r
+
+        vae.encode, vae.decode = _timed_encode, _timed_decode
+
+        # T5 is invoked as text_encoder(...) → __call__ is resolved on the type.
+        te_cls = type(self.pipe.text_encoder)
+        if not getattr(te_cls, '_timing_wrapped', False):
+            _ocall = te_cls.__call__
+
+            def _timed_call(self_te, *a, **k):
+                s = time.time(); r = _ocall(self_te, *a, **k)
+                server._timings['t5'] += time.time() - s
+                return r
+
+            te_cls.__call__ = _timed_call
+            te_cls._timing_wrapped = True
 
     def _load_our_fp8(self, high_noise_dir: str, low_noise_dir: str) -> None:
         """FP8 path. On big cards (keep_resident) both DiTs move to the GPU and
@@ -473,6 +563,9 @@ class ModelServer:
 
             print(f"Generating {resolution} (max_area={max_area}), {frame_num} frames, {sample_steps} steps")
 
+            # Reset per-phase timers (populated by the wrappers in _instrument_timing)
+            self._timings = {'t5': 0.0, 'vae_encode': 0.0, 'vae_decode': 0.0}
+
             # On a big card both DiTs are resident, so no offload. On a small
             # card offload the inactive DiT to CPU during the diffusion loop —
             # two FP8 DiTs (~27 GB) won't coexist with the VAE + activations.
@@ -509,7 +602,14 @@ class ModelServer:
 
             size_mb  = Path(output_path).stat().st_size / 1024 / 1024
             gen_time = time.time() - start
+
+            # Per-phase breakdown: the diffusion loop is whatever isn't T5/VAE.
+            t = self._timings
+            loop_time = gen_time - t['t5'] - t['vae_encode'] - t['vae_decode']
             print(f"✓ Done in {gen_time:.1f}s — {size_mb:.1f} MB")
+            print(f"  timing: diffusion_loop={loop_time:.1f}s | t5_encode={t['t5']:.1f}s | "
+                  f"vae_encode={t['vae_encode']:.1f}s | vae_decode={t['vae_decode']:.1f}s "
+                  f"({sample_steps} steps → {loop_time/max(sample_steps,1):.1f}s/step)")
 
             return {
                 "success": True,

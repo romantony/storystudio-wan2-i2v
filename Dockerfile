@@ -44,6 +44,24 @@ RUN python3 -m pip install --no-cache-dir \
     --index-url https://download.pytorch.org/whl/cu128 && \
     python3 -m pip cache purge
 
+# FlashAttention 2 (best-effort). Wan's attention routes to the real flash kernel
+# when `flash_attn` imports; otherwise it falls back to PyTorch SDPA (the
+# 'Padding mask disabled' path). Try prebuilt wheels matching torch 2.7 / cu12 /
+# cp310 across both C++ ABIs and a few versions. NON-FATAL: a wheel mismatch must
+# not break the build — we confirm activation from the startup log and pin the
+# exact wheel later if needed.
+RUN set +e; \
+    for FA in 2.8.2 2.8.1 2.8.0.post2 2.7.4.post1; do \
+      for ABI in TRUE FALSE; do \
+        URL="https://github.com/Dao-AILab/flash-attention/releases/download/v${FA}/flash_attn-${FA}+cu12torch2.7cxx11abi${ABI}-cp310-cp310-linux_x86_64.whl"; \
+        echo "Trying flash-attn $FA abi=$ABI"; \
+        python3 -m pip install --no-cache-dir "$URL" && break 2; \
+      done; \
+    done; \
+    python3 -c "import flash_attn; print('flash-attn', flash_attn.__version__)" \
+      || echo "flash-attn NOT installed — runtime will use PyTorch SDPA fallback"; \
+    python3 -m pip cache purge; true
+
 RUN python3 -m pip install --no-cache-dir \
     transformers==4.51.3 \
     "diffusers>=0.33.0" \
@@ -68,10 +86,14 @@ RUN python3 -m pip install --no-cache-dir \
     tqdm && \
     python3 -m pip cache purge
 
-# Verify critical packages import and confirm the torch CUDA build is 12.x (not 13.x)
+# Verify critical packages import and confirm the torch CUDA build is 12.x (not 13.x).
+# Also print torch's C++ ABI + flash-attn status so we can pin the right wheel if missed.
 RUN python3 -c "import runpod, diffusers, torch, torchvision, easydict; \
 print(f'OK — runpod={runpod.__version__} diffusers={diffusers.__version__} torch={torch.__version__} torchvision={torchvision.__version__} cuda={torch.version.cuda}'); \
-assert torch.version.cuda.startswith('12'), f'torch CUDA build {torch.version.cuda} requires too-new a driver'"
+print(f'torch cxx11_abi={torch._C._GLIBCXX_USE_CXX11_ABI}'); \
+assert torch.version.cuda.startswith('12'), f'torch CUDA build {torch.version.cuda} requires too-new a driver'" && \
+    (python3 -c "import flash_attn; print('flash-attn', flash_attn.__version__, 'OK')" \
+     || echo "flash-attn not present — SDPA fallback")
 
 # Verify Wan2.2 code was cloned correctly
 RUN test -f /workspace/wan22/wan/configs/__init__.py && \
