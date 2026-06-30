@@ -347,18 +347,37 @@ class ModelServer:
         logging.getLogger("diffusers").setLevel(logging.ERROR)
         logging.getLogger("transformers").setLevel(logging.ERROR)
 
-        self.pipe = WanI2V(
-            config=cfg,
-            checkpoint_dir=MODEL_PATH,
-            device_id=0,
-            rank=0,
-            t5_fsdp=False,
-            dit_fsdp=False,
-            use_sp=False,
-            t5_cpu=True,
-            init_on_cpu=True,           # DiTs start on meta device
-            convert_model_dtype=False,
-        )
+        # Monkey-patch WanModel.from_pretrained to create empty model skeleton.
+        # WanI2V.__init__ calls from_pretrained which expects diffusers-format weight
+        # files we don't have — our FP8 weights are loaded separately below.
+        from wan.modules.model import WanModel
+        from accelerate import init_empty_weights
+        _orig_from_pretrained = WanModel.from_pretrained
+
+        @classmethod
+        def _empty_from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
+            print(f"    [patch] Creating empty {cls.__name__} skeleton (weights loaded via FP8 loader)")
+            config, _ = cls.load_config(pretrained_model_name_or_path, return_unused_kwargs=True)
+            config = {k: v for k, v in config.items() if not k.startswith('_')}
+            with init_empty_weights():
+                return cls(**config)
+
+        WanModel.from_pretrained = _empty_from_pretrained
+        try:
+            self.pipe = WanI2V(
+                config=cfg,
+                checkpoint_dir=MODEL_PATH,
+                device_id=0,
+                rank=0,
+                t5_fsdp=False,
+                dit_fsdp=False,
+                use_sp=False,
+                t5_cpu=True,
+                init_on_cpu=True,
+                convert_model_dtype=False,
+            )
+        finally:
+            WanModel.from_pretrained = _orig_from_pretrained
 
         if self.using_fp8_format:
             self._load_our_fp8(high_noise_dir, low_noise_dir)
