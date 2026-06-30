@@ -350,14 +350,19 @@ class ModelServer:
         # Monkey-patch WanModel.from_pretrained to create empty model skeleton.
         # WanI2V.__init__ calls from_pretrained which expects diffusers-format weight
         # files we don't have — our FP8 weights are loaded separately below.
+        # We read each DiT's config.json directly from its subfolder and build the
+        # module on the meta device; real weights are assigned in _load_our_fp8.
         from wan.modules.model import WanModel
         from accelerate import init_empty_weights
         _orig_from_pretrained = WanModel.from_pretrained
 
         @classmethod
         def _empty_from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
-            print(f"    [patch] Creating empty {cls.__name__} skeleton (weights loaded via FP8 loader)")
-            config, _ = cls.load_config(pretrained_model_name_or_path, return_unused_kwargs=True)
+            subfolder = kwargs.get('subfolder', '') or ''
+            cfg_path = os.path.join(pretrained_model_name_or_path, subfolder, 'config.json')
+            print(f"    [patch] Building empty {cls.__name__} skeleton from {cfg_path}")
+            with open(cfg_path) as f:
+                config = json.load(f)
             config = {k: v for k, v in config.items() if not k.startswith('_')}
             with init_empty_weights():
                 return cls(**config)
@@ -381,6 +386,11 @@ class ModelServer:
 
         if self.using_fp8_format:
             self._load_our_fp8(high_noise_dir, low_noise_dir)
+            # Both DiTs are resident on GPU. Disable WanI2V's per-timestep
+            # CPU<->GPU offload (gated on init_on_cpu) so they stay put — the
+            # whole point of the FP8 path. generate() is also called with
+            # offload_model=False, so _prepare_model_for_timestep becomes a no-op.
+            self.pipe.init_on_cpu = False
         else:
             self._load_nalexand_fp8(high_noise_dir, low_noise_dir)
 
