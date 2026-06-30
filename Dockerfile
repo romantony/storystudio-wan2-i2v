@@ -34,6 +34,16 @@ RUN git clone --depth 1 https://github.com/Wan-Video/Wan2.2.git /workspace/wan22
       -e 's/from \.\.modules\.attention import flash_attention/from ..modules.attention import attention as flash_attention/g' \
       -e 's/from wan\.modules\.attention import flash_attention/from wan.modules.attention import attention as flash_attention/g'
 
+# Pin torch + torchvision to a CUDA 12.8 build. cu128 supports BOTH Blackwell
+# (RTX 5090) and Ada (RTX 6000 Ada / L40S), and runs on any host whose driver
+# supports CUDA >= 12.8 (incl. the 12.9 Ada hosts). Installing torchvision
+# unpinned would otherwise drag in a cu130 torch that needs a CUDA-13 driver
+# many RunPod hosts don't have, crashing torch.cuda init with "driver too old".
+RUN python3 -m pip install --no-cache-dir \
+    torch==2.7.0 torchvision==0.22.0 \
+    --index-url https://download.pytorch.org/whl/cu128 && \
+    python3 -m pip cache purge
+
 RUN python3 -m pip install --no-cache-dir \
     transformers==4.51.3 \
     "diffusers>=0.33.0" \
@@ -49,7 +59,6 @@ RUN python3 -m pip install --no-cache-dir \
     ftfy==6.3.1 \
     easydict \
     einops \
-    torchvision \
     regex \
     requests==2.32.3 \
     boto3==1.35.76 \
@@ -59,8 +68,10 @@ RUN python3 -m pip install --no-cache-dir \
     tqdm && \
     python3 -m pip cache purge
 
-# Verify critical packages are importable by the runtime Python
-RUN python3 -c "import runpod; import diffusers; import torch; import easydict; print(f'OK — runpod={runpod.__version__} diffusers={diffusers.__version__} torch={torch.__version__}')"
+# Verify critical packages import and confirm the torch CUDA build is 12.x (not 13.x)
+RUN python3 -c "import runpod, diffusers, torch, torchvision, easydict; \
+print(f'OK — runpod={runpod.__version__} diffusers={diffusers.__version__} torch={torch.__version__} torchvision={torchvision.__version__} cuda={torch.version.cuda}'); \
+assert torch.version.cuda.startswith('12'), f'torch CUDA build {torch.version.cuda} requires too-new a driver'"
 
 # Verify Wan2.2 code was cloned correctly
 RUN test -f /workspace/wan22/wan/configs/__init__.py && \
