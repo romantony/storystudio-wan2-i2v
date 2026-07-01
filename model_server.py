@@ -549,6 +549,7 @@ class ModelServer:
         try:
             image_path   = params["image_path"]
             prompt       = params.get("prompt", "")
+            n_prompt     = params.get("n_prompt", "")
             resolution   = params.get("resolution", "480p")
             sample_steps = params.get("sample_steps", 25)
             frame_num    = params.get("frame_num", 81)
@@ -580,7 +581,7 @@ class ModelServer:
                 sample_solver='unipc',
                 sampling_steps=sample_steps,
                 guide_scale=5.0,
-                n_prompt="",
+                n_prompt=n_prompt,
                 seed=-1,
                 offload_model=offload,
             )

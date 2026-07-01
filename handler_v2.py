@@ -217,6 +217,7 @@ def generate_video(job: Dict[str, Any]) -> Dict[str, Any]:
         # Get parameters
         image_input = job_input["image"]
         prompt = job_input.get("prompt", "")
+        n_prompt = job_input.get("n_prompt", "")
         resolution = job_input.get("resolution", "480p")
         sample_steps = job_input.get("sample_steps", 30)
         frame_num = job_input.get("frame_num", 81)
@@ -270,6 +271,7 @@ def generate_video(job: Dict[str, Any]) -> Dict[str, Any]:
                 "job_id": job_id,
                 "image_path": str(image_path),
                 "prompt": prompt,
+                "n_prompt": n_prompt,
                 "resolution": resolution,
                 "sample_steps": sample_steps,
                 "frame_num": frame_num,
