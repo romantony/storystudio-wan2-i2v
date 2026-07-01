@@ -520,16 +520,28 @@ class ModelServer:
                     and next(t5_module.parameters(), None) is not None
                     and next(t5_module.parameters()).device.type == 'cpu'
                 )
+
+                _orig_fwd = None
                 if was_on_cpu:
                     t0 = time.time()
                     t5_module.to(torch.device('cuda', 0))
                     print(f"    T5 → GPU in {time.time()-t0:.2f}s", flush=True)
+                    # Tokenizer outputs are CPU tensors; patch forward to move them
+                    # to GPU before the embedding index_select to avoid device mismatch.
+                    _orig_fwd = t5_module.forward
+                    def _gpu_fwd(*fa, **fk):
+                        fa = tuple(x.cuda() if isinstance(x, torch.Tensor) else x for x in fa)
+                        fk = {k2: v.cuda() if isinstance(v, torch.Tensor) else v
+                              for k2, v in fk.items()}
+                        return _orig_fwd(*fa, **fk)
+                    t5_module.forward = _gpu_fwd
 
                 s = time.time()
                 r = _ocall(self_te, *a, **k)
                 server._timings['t5'] += time.time() - s
 
                 if was_on_cpu:
+                    t5_module.forward = _orig_fwd
                     t0 = time.time()
                     t5_module.to('cpu')
                     torch.cuda.empty_cache()
