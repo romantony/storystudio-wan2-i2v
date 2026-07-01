@@ -27,6 +27,33 @@ RUN git clone --depth 1 https://github.com/Wan-Video/Wan2.2.git /workspace/wan22
     > /workspace/wan22/wan/__init__.py && \
     sed -i 's/device=torch\.cuda\.current_device()/device=0/g' /workspace/wan22/wan/modules/t5.py
 
+# Patch rope_apply to free the float64 intermediate list before the float32 conversion.
+#
+# rope_apply uses float64 internally for RoPE numerical stability. On a 48 GB GPU with
+# the Wan2.2-14B dual-DiT setup (~44.7 GB base VRAM), the peak allocation sequence is:
+#   float64 output list  →  1.34 GB
+#   torch.stack(output)  →  +1.34 GB  (47.4 GB total — fits)
+#   .float()             →  +0.62 GB  (48.0 GB — OOM!)
+#
+# Fix: rebind `output = torch.stack(output)`. CPython's reference counting immediately
+# frees the float64 list when the name is rebound, so .float() sees only 46.1+0.62=46.7 GB.
+RUN python3 - << 'PYEOF'
+import pathlib
+path = pathlib.Path('/workspace/wan22/wan/modules/model.py')
+code = path.read_text()
+old = '    return torch.stack(output).float()'
+new = (
+    '    output = torch.stack(output)  '
+    '# rebind frees float64 list → .float() fits in 48 GB VRAM\n'
+    '    return output.float()'
+)
+if old not in code:
+    raise RuntimeError(f"rope_apply patch target not found in {path}; check Wan2.2 version")
+patched = code.replace(old, new, 1)
+path.write_text(patched)
+print(f"Patched rope_apply in {path}: float64 list freed before float32 conversion")
+PYEOF
+
 # Pin torch + torchvision to a CUDA 12.8 build. cu128 supports BOTH Blackwell
 # (RTX 5090) and Ada (RTX 6000 Ada / L40S), and runs on any host whose driver
 # supports CUDA >= 12.8 (incl. the 12.9 Ada hosts). Installing torchvision

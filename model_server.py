@@ -468,10 +468,14 @@ class ModelServer:
         import torch
         freed_bytes = 0
         if self.pipe is not None:
-            for module in self.pipe.modules():
-                if hasattr(module, '_cached_w') and module._cached_w is not None:
-                    freed_bytes += module._cached_w.element_size() * module._cached_w.nelement()
-                    module._cached_w = None
+            for attr in ('high_noise_model', 'low_noise_model'):
+                model = getattr(self.pipe, attr, None)
+                if model is None:
+                    continue
+                for module in model.modules():
+                    if hasattr(module, '_cached_w') and module._cached_w is not None:
+                        freed_bytes += module._cached_w.element_size() * module._cached_w.nelement()
+                        module._cached_w = None
         FP8Linear.cache_used_bytes = 0
         if freed_bytes:
             torch.cuda.empty_cache()
