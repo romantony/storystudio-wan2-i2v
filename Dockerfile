@@ -27,31 +27,43 @@ RUN git clone --depth 1 https://github.com/Wan-Video/Wan2.2.git /workspace/wan22
     > /workspace/wan22/wan/__init__.py && \
     sed -i 's/device=torch\.cuda\.current_device()/device=0/g' /workspace/wan22/wan/modules/t5.py
 
-# Patch rope_apply to free the float64 intermediate list before the float32 conversion.
+# Patch rope_apply to use float32 instead of float64 internally.
 #
-# rope_apply uses float64 internally for RoPE numerical stability. On a 48 GB GPU with
-# the Wan2.2-14B dual-DiT setup (~44.7 GB base VRAM), the peak allocation sequence is:
-#   float64 output list  →  1.34 GB
-#   torch.stack(output)  →  +1.34 GB  (47.4 GB total — fits)
-#   .float()             →  +0.62 GB  (48.0 GB — OOM!)
+# rope_apply uses torch.float64 for numerical stability, but on RTX 6000 Ada (47.4 GB)
+# with both 14B FP8 DiTs resident (~45.5 GB base VRAM), the float64 path peaks at:
 #
-# Fix: rebind `output = torch.stack(output)`. CPython's reference counting immediately
-# frees the float64 list when the name is rebound, so .float() sees only 46.1+0.62=46.7 GB.
+#   x[i, :seq_len].to(float64)           →  1.30 GB complex128 intermediate
+#   x_i * freqs_i (complex128 result)    →  +1.30 GB  (simultaneous with source)
+#   view_as_real → flatten → output list →  1.30 GB float64 in output
+#   torch.stack(output).float()          →  +0.62 GB float32  ← OOM (only 602 MB free)
+#
+# Fix: use float32 (.float()) instead of float64 (.to(torch.float64)), and cast freqs_i
+# to complex64 so the multiply stays in float32 instead of upcasting to float64.
+# Peak with float32: two simultaneous complex64 copies = 2×0.65 GB = 1.30 GB above base
+# (vs 2×1.30 GB = 2.60 GB with float64). float32 RoPE is standard in all other models.
 RUN python3 - << 'PYEOF'
-import pathlib
+import pathlib, re
+
 path = pathlib.Path('/workspace/wan22/wan/modules/model.py')
 code = path.read_text()
-old = '    return torch.stack(output).float()'
-new = (
-    '    output = torch.stack(output)  '
-    '# rebind frees float64 list → .float() fits in 48 GB VRAM\n'
-    '    return output.float()'
-)
-if old not in code:
-    raise RuntimeError(f"rope_apply patch target not found in {path}; check Wan2.2 version")
-patched = code.replace(old, new, 1)
-path.write_text(patched)
-print(f"Patched rope_apply in {path}: float64 list freed before float32 conversion")
+
+# 1. Downgrade intermediate precision: float64 → float32
+old1 = '.to(torch.float64).reshape('
+new1 = '.float().reshape('
+if old1 not in code:
+    raise RuntimeError(f"Patch target 1 not found in {path}")
+code = code.replace(old1, new1, 1)
+
+# 2. Cast freqs_i to match x_i dtype (complex64) to prevent upcast during multiply.
+#    Without this, complex64 × complex128 → complex128 (no memory savings).
+old2 = 'x_i = torch.view_as_real(x_i * freqs_i).flatten(2)'
+new2 = 'x_i = torch.view_as_real(x_i * freqs_i.to(x_i.dtype)).flatten(2)'
+if old2 not in code:
+    raise RuntimeError(f"Patch target 2 not found in {path}")
+code = code.replace(old2, new2, 1)
+
+path.write_text(code)
+print(f"Patched rope_apply in {path}: float64 → float32 (saves ~1.3 GB peak VRAM per call)")
 PYEOF
 
 # Pin torch + torchvision to a CUDA 12.8 build. cu128 supports BOTH Blackwell
