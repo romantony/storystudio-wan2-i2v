@@ -454,7 +454,14 @@ class ModelServer:
             return
         free, _total = torch.cuda.mem_get_info()
         free_gb = free / 1024**3
-        reserve_gb = float(os.getenv("DEQUANT_CACHE_RESERVE_GB", "8"))
+        # SDPA (no FA2) needs ~14 GB headroom for O(N²) attention intermediates at
+        # 480p/81 frames. If FA2 is active, O(N) memory lets us drop to ~10 GB.
+        try:
+            import flash_attn
+            default_reserve = "10"
+        except ImportError:
+            default_reserve = "14"
+        reserve_gb = float(os.getenv("DEQUANT_CACHE_RESERVE_GB", default_reserve))
         budget_gb = max(0.0, free_gb - reserve_gb)
         FP8Linear.cache_used_bytes = 0
         FP8Linear.cache_budget_bytes = int(budget_gb * 1024**3)
