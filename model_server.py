@@ -504,13 +504,36 @@ class ModelServer:
         vae.encode, vae.decode = _timed_encode, _timed_decode
 
         # T5 is invoked as text_encoder(...) → __call__ is resolved on the type.
+        # Also temporarily moves T5 to GPU for each encode call so it runs in
+        # milliseconds instead of ~110s on CPU. PCIe transfer (7.8 GB) ≈ 0.25s
+        # each way — still ~100× faster than CPU inference per prompt.
         te_cls = type(self.pipe.text_encoder)
         if not getattr(te_cls, '_timing_wrapped', False):
             _ocall = te_cls.__call__
 
             def _timed_call(self_te, *a, **k):
-                s = time.time(); r = _ocall(self_te, *a, **k)
+                import torch
+                t5_module = getattr(self_te, 'model', None)
+                was_on_cpu = (
+                    t5_module is not None
+                    and isinstance(t5_module, torch.nn.Module)
+                    and next(t5_module.parameters(), None) is not None
+                    and next(t5_module.parameters()).device.type == 'cpu'
+                )
+                if was_on_cpu:
+                    t0 = time.time()
+                    t5_module.to(torch.device('cuda', 0))
+                    print(f"    T5 → GPU in {time.time()-t0:.2f}s", flush=True)
+
+                s = time.time()
+                r = _ocall(self_te, *a, **k)
                 server._timings['t5'] += time.time() - s
+
+                if was_on_cpu:
+                    t0 = time.time()
+                    t5_module.to('cpu')
+                    torch.cuda.empty_cache()
+                    print(f"    T5 → CPU in {time.time()-t0:.2f}s", flush=True)
                 return r
 
             te_cls.__call__ = _timed_call
