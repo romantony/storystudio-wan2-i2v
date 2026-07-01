@@ -454,7 +454,7 @@ class ModelServer:
             return
         free, _total = torch.cuda.mem_get_info()
         free_gb = free / 1024**3
-        reserve_gb = float(os.getenv("DEQUANT_CACHE_RESERVE_GB", "14"))
+        reserve_gb = float(os.getenv("DEQUANT_CACHE_RESERVE_GB", "8"))
         budget_gb = max(0.0, free_gb - reserve_gb)
         FP8Linear.cache_used_bytes = 0
         FP8Linear.cache_budget_bytes = int(budget_gb * 1024**3)

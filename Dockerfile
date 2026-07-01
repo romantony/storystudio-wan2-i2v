@@ -25,14 +25,7 @@ WORKDIR /workspace
 RUN git clone --depth 1 https://github.com/Wan-Video/Wan2.2.git /workspace/wan22 && \
     printf '# trimmed for i2v-only usage\nfrom . import configs, distributed, modules\nfrom .image2video import WanI2V\n' \
     > /workspace/wan22/wan/__init__.py && \
-    sed -i 's/device=torch\.cuda\.current_device()/device=0/g' /workspace/wan22/wan/modules/t5.py && \
-    # FlashAttention is not installed (does not build on these images). Route every
-    # `flash_attention` import to attention(), which has a PyTorch SDPA fallback.
-    grep -rl 'import flash_attention' /workspace/wan22/wan | \
-    xargs -r sed -i \
-      -e 's/from \.attention import flash_attention/from .attention import attention as flash_attention/g' \
-      -e 's/from \.\.modules\.attention import flash_attention/from ..modules.attention import attention as flash_attention/g' \
-      -e 's/from wan\.modules\.attention import flash_attention/from wan.modules.attention import attention as flash_attention/g'
+    sed -i 's/device=torch\.cuda\.current_device()/device=0/g' /workspace/wan22/wan/modules/t5.py
 
 # Pin torch + torchvision to a CUDA 12.8 build. cu128 supports BOTH Blackwell
 # (RTX 5090) and Ada (RTX 6000 Ada / L40S), and runs on any host whose driver
@@ -58,9 +51,44 @@ RUN set +e; \
         python3 -m pip install --no-cache-dir "$URL" && break 2; \
       done; \
     done; \
+    python3 -c "import flash_attn" 2>/dev/null || \
+      python3 -m pip install --no-cache-dir flash_attn --prefer-binary --no-build-isolation 2>&1 | tail -3; \
     python3 -c "import flash_attn; print('flash-attn', flash_attn.__version__)" \
       || echo "flash-attn NOT installed — runtime will use PyTorch SDPA fallback"; \
     python3 -m pip cache purge; true
+
+# Redirect flash_attention imports to SDPA fallback ONLY when flash_attn is unavailable.
+# If flash_attn installed successfully above, native flash_attention() uses the FA2 kernel
+# and this step is a no-op. If not, redirect to attention() which falls back to PyTorch SDPA.
+RUN python3 - << 'PYEOF'
+import sys
+try:
+    import flash_attn
+    print(f"flash_attn {flash_attn.__version__} present — native FA2 kernel active, skipping redirect")
+    sys.exit(0)
+except ImportError:
+    pass
+import pathlib
+subs = [
+    ('from .attention import flash_attention',            'from .attention import attention as flash_attention'),
+    ('from ..modules.attention import flash_attention',   'from ..modules.attention import attention as flash_attention'),
+    ('from wan.modules.attention import flash_attention', 'from wan.modules.attention import attention as flash_attention'),
+]
+patched = 0
+for py in pathlib.Path('/workspace/wan22/wan').rglob('*.py'):
+    try:
+        code = py.read_text()
+    except Exception:
+        continue
+    updated = code
+    for old, new in subs:
+        updated = updated.replace(old, new)
+    if updated != code:
+        py.write_text(updated)
+        print(f"  patched {py}")
+        patched += 1
+print(f"flash_attn unavailable — redirected flash_attention→attention() in {patched} file(s) (SDPA fallback)")
+PYEOF
 
 RUN python3 -m pip install --no-cache-dir \
     transformers==4.51.3 \

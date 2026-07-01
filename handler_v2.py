@@ -233,10 +233,25 @@ def generate_video(job: Dict[str, Any]) -> Dict[str, Any]:
         
         # Handle image input (URL or base64)
         if image_input.startswith(('http://', 'https://')):
-            print(f"Downloading image from URL: {image_input}")
-            response = requests.get(image_input, timeout=30)
-            response.raise_for_status()
-            image_bytes = response.content
+            t0 = time.time()
+            # For our own R2-backed URLs, bypass the web server and pull directly
+            # from R2 — avoids the minutes of latency from RunPod → app server → R2.
+            r2_fetched = False
+            if f"{R2_PUBLIC_URL}/" in image_input:
+                r2_key = image_input.split(f"{R2_PUBLIC_URL}/", 1)[1]
+                try:
+                    print(f"Downloading image from R2 directly: {r2_key}")
+                    obj = get_r2_client().get_object(Bucket=R2_BUCKET_NAME, Key=r2_key)
+                    image_bytes = obj["Body"].read()
+                    r2_fetched = True
+                except Exception as r2_err:
+                    print(f"R2 direct fetch failed ({r2_err}), falling back to HTTP")
+            if not r2_fetched:
+                print(f"Downloading image from URL: {image_input}")
+                response = requests.get(image_input, timeout=(10, 60))
+                response.raise_for_status()
+                image_bytes = response.content
+            print(f"Image ready: {len(image_bytes)/1024:.0f} KB in {time.time()-t0:.1f}s")
         else:
             image_bytes = base64.b64decode(image_input)
         
