@@ -454,20 +454,28 @@ class ModelServer:
             return
         free, _total = torch.cuda.mem_get_info()
         free_gb = free / 1024**3
-        # SDPA (no FA2) needs ~14 GB headroom for O(N²) attention intermediates at
-        # 480p/81 frames. If FA2 is active, O(N) memory lets us drop to ~10 GB.
-        try:
-            import flash_attn
-            default_reserve = "10"
-        except ImportError:
-            default_reserve = "14"
-        reserve_gb = float(os.getenv("DEQUANT_CACHE_RESERVE_GB", default_reserve))
+        reserve_gb = float(os.getenv("DEQUANT_CACHE_RESERVE_GB", "14"))
         budget_gb = max(0.0, free_gb - reserve_gb)
         FP8Linear.cache_used_bytes = 0
         FP8Linear.cache_budget_bytes = int(budget_gb * 1024**3)
         FP8Linear.cache_enabled = budget_gb > 0.5
         print(f"    Dequant cache: {'on' if FP8Linear.cache_enabled else 'off'} — "
               f"free {free_gb:.1f} GB, reserve {reserve_gb:.0f} GB, cache budget {budget_gb:.1f} GB")
+
+    def _clear_dequant_cache(self) -> None:
+        """Free all cached BF16 weights and reset the cache budget counter.
+        Called after any job failure so the next job starts with clean VRAM."""
+        import torch
+        freed_bytes = 0
+        if self.pipe is not None:
+            for module in self.pipe.modules():
+                if hasattr(module, '_cached_w') and module._cached_w is not None:
+                    freed_bytes += module._cached_w.element_size() * module._cached_w.nelement()
+                    module._cached_w = None
+        FP8Linear.cache_used_bytes = 0
+        if freed_bytes:
+            torch.cuda.empty_cache()
+            print(f"    Cleared dequant cache: freed {freed_bytes/1024**3:.1f} GB VRAM")
 
     def _instrument_timing(self) -> None:
         """Wrap T5 encode and VAE encode/decode to record per-phase durations,
@@ -628,6 +636,7 @@ class ModelServer:
 
         except Exception as e:
             traceback.print_exc()
+            self._clear_dequant_cache()
             return {"success": False, "error": str(e)}
 
     def run(self):
